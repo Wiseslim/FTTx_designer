@@ -38,6 +38,7 @@ from qgis.analysis import (
 
 import processing
 import numpy as np
+import heapq
 
 # =============================================================================
 # CUSTOM LOGGING HANDLER FOR GUI
@@ -121,7 +122,7 @@ MAX_BOX_TO_CUSTOMER_DISTANCE = 150  # meters
 DROP_LENGTH_TOLERANCE = 1.0  # meters; tolerance for snap offsets and geometry precision
 SNAP_OFFSET_DISTANCE = 1  # meters
 MAX_FAT_PER_FDT = 8
-MIN_FAT_PER_FDT = 8  # minimum FATs per FDT; underfilled FDTs borrow from connected roads
+MIN_FAT_PER_FDT = 7  # minimum FATs per FDT; underfilled FDTs borrow from connected roads
 MAX_CUSTOMERS_PER_FAT = 8
 MAX_FAT_TO_FAT_DISTANCE = 150
 MAX_FAT_PER_WING = 4
@@ -160,6 +161,70 @@ OPTIONAL_LAYER_CANDIDATES = {
 }
 FAST_MODE_DEFAULT = True  # enable performance-friendly clustering by default
 
+# =============================================================================
+# ROAD TOPOLOGY ANALYSIS CONSTANTS
+# Govern the topology engine that runs before any FAT/FDT/routing logic.
+# All values are in metres or degrees as noted.
+# =============================================================================
+
+# Endpoint snapping: dangling road ends within this radius are merged into one
+# shared node, healing the topology gaps that plague OSM Nigeria exports.
+TOPOLOGY_SNAP_TOLERANCE: float = 1.5
+
+# Corridor detection: two consecutive road segments belong to the same
+# topological corridor if their bearing deviation is below this threshold.
+CORRIDOR_ANGLE_THRESHOLD: float = 45.0
+
+# Dual-carriageway detection thresholds
+DUAL_CW_MAX_SEPARATION: float  = 30.0   # lateral distance between carriageways (m)
+DUAL_CW_BEARING_TOLERANCE: float = 20.0 # max bearing diff to be considered parallel
+DUAL_CW_MIN_LENGTH_RATIO: float  = 0.35 # shorter/longer length ratio lower bound
+
+# A corridor must be at least this long (m) before topology-inference can
+# upgrade it to PRIMARY class without an OSM highway=primary tag.
+MIN_PRIMARY_CORRIDOR_LEN: float = 300.0
+
+# Edge-weight multipliers used in the topology-aware Dijkstra.
+# Higher weights penalise routing through those road classes.
+ROUTING_WEIGHTS: Dict[str, float] = {
+    'PRIMARY':          1.0,
+    'SECONDARY':        1.4,
+    'TERTIARY':         2.0,
+    'DEAD_END':         3.5,   # heavy penalty — cable should not enter a dead-end
+    'DUAL_CARRIAGEWAY': 1.2,
+    'SERVICE':          4.5,
+    'UNKNOWN':          2.0,
+}
+
+# Routing recovery: virtual connector edges injected during topology analysis
+# to bridge small OSM topology gaps (> TOPOLOGY_SNAP_TOLERANCE but < this value).
+# These give the router a high-cost but valid alternative to a straight-line.
+VIRTUAL_CONNECTOR_RADIUS: float = 8.0      # m — max gap healed by virtual edge
+VIRTUAL_CONNECTOR_PENALTY: float = 2000.0  # m-equivalent extra cost per virtual hop
+# 2000 m ensures virtual connectors are only used when NO road path exists at all.
+# Any real road path (even 500 m of tertiary road) is cheaper than one virtual hop.
+
+# Turn-penalty costs added to Dijkstra edge weight when the cable changes direction.
+# Discourages backtracking and unrealistic zigzag paths without forcing strict routing.
+TURN_PENALTY_SLIGHT:   float =  5.0   # bearing change  < 30°
+TURN_PENALTY_MODERATE: float = 20.0   # bearing change 30–90°
+TURN_PENALTY_SHARP:    float = 50.0   # bearing change 90–150°
+TURN_PENALTY_REVERSAL: float = 150.0  # bearing change > 150° (near-U-turn)
+
+# Maps raw OSM highway=* values to our five-class taxonomy.
+OSM_HIGHWAY_CLASS_MAP: Dict[str, str] = {
+    'motorway':       'PRIMARY',   'motorway_link':  'PRIMARY',
+    'trunk':          'PRIMARY',   'trunk_link':     'PRIMARY',
+    'primary':        'PRIMARY',   'primary_link':   'PRIMARY',
+    'secondary':      'SECONDARY', 'secondary_link': 'SECONDARY',
+    'tertiary':       'TERTIARY',  'tertiary_link':  'TERTIARY',
+    'residential':    'TERTIARY',  'unclassified':   'TERTIARY',
+    'living_street':  'TERTIARY',
+    'service':        'SERVICE',   'track':          'SERVICE',
+    'path':           'SERVICE',   'footway':        'SERVICE',
+    'cycleway':       'SERVICE',
+}
+
 @dataclass
 class FTTXConfig:
     """User-configurable runtime settings."""
@@ -174,12 +239,37 @@ class FTTXConfig:
     fast_mode: bool = FAST_MODE_DEFAULT
 
 # =============================================================================
+# ROAD CLASS TAXONOMY
+# Defined here (before the data-classes) so RoadSegment can reference it.
+# =============================================================================
+
+class RoadClass(Enum):
+    """Five-class road taxonomy used by the topology engine."""
+    PRIMARY          = "PRIMARY"           # motorway, trunk, primary
+    SECONDARY        = "SECONDARY"         # secondary, secondary_link
+    TERTIARY         = "TERTIARY"          # residential, unclassified, tertiary
+    DEAD_END         = "DEAD_END"          # segment that terminates at a degree-1 node
+    DUAL_CARRIAGEWAY = "DUAL_CARRIAGEWAY"  # one side of a paired divided road
+    SERVICE          = "SERVICE"           # service lanes, tracks, paths
+    UNKNOWN          = "UNKNOWN"           # no tag and insufficient topology signal
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
 @dataclass
 class RoadSegment:
-    """Represents a road segment with its properties"""
+    """Represents a road segment with its properties.
+
+    Topology fields (populated by RoadTopologyEngine before any FAT/FDT logic):
+        road_class            – inferred or tag-driven road classification
+        is_dead_end           – True when one endpoint is a degree-1 node
+        dead_end_junction_pt  – the high-degree endpoint (junction end) of a dead-end
+        corridor_id           – corridor chain this segment belongs to (-1 = unassigned)
+        dual_cw_partner       – road_id of the paired carriageway, or None
+        routing_weight        – Dijkstra edge-weight multiplier from ROUTING_WEIGHTS
+        snapped_start/end     – corrected endpoint after endpoint-snap repair
+    """
     id: int
     geometry: QgsGeometry
     fid: int
@@ -188,6 +278,15 @@ class RoadSegment:
     total_customers: int = 0
     fat_count: int = 0
     fats: List['FAT'] = field(default_factory=list)
+    # --- topology fields ---
+    road_class: RoadClass = RoadClass.UNKNOWN
+    is_dead_end: bool = False
+    dead_end_junction_pt: Optional[QgsPointXY] = None
+    corridor_id: int = -1
+    dual_cw_partner: Optional[int] = None
+    routing_weight: float = ROUTING_WEIGHTS['UNKNOWN']
+    snapped_start: Optional[QgsPointXY] = None
+    snapped_end: Optional[QgsPointXY] = None
 
 @dataclass
 class Homepass:
@@ -267,6 +366,7 @@ class FDT:
     fats: List[FAT] = field(default_factory=list)
     zone_geometry: Optional[QgsGeometry] = None
     snapped_geometry: Optional[QgsPointXY] = None
+    primary_road_id: Optional[int] = None
 
 class WingType(Enum):
     A = "A"  # Right side
@@ -855,20 +955,903 @@ def _offset_point_by_side(point: QgsPointXY,
     )
 
 # =============================================================================
+# ROAD TOPOLOGY ENGINE
+# Runs before ALL FAT/FDT/routing logic.  Repairs OSM topology defects,
+# infers road hierarchy, detects dead-ends and dual carriageways, builds
+# corridor chains, and emits a weighted adjacency graph for Dijkstra.
+# =============================================================================
+
+class RoadTopologyEngine:
+    """Topology analysis and repair engine for OSM road layers.
+
+    Pipeline (called via .analyze()):
+      1. Build raw node/edge graph from road-segment endpoints.
+      2. Snap dangling endpoints – heal the near-miss gaps common in OSM Nigeria.
+      3. Detect dead-end terminal nodes (degree == 1).
+      4. Build corridor chains using angular-continuity analysis.
+      5. Detect dual-carriageway pairs (parallel, same bearing, similar length).
+      6. Infer road hierarchy from OSM tags + topology signals (degree, corridor len).
+      7. Assign routing-weight multipliers per road class.
+      8. Build weighted adjacency list for topology-aware Dijkstra.
+      9. Validate: report disconnected graph components.
+
+    All results are stored back into the RoadSegment objects so that
+    every downstream module (generate_fdts, CableRouter, assign_wings_per_fdt)
+    can query road.road_class, road.is_dead_end, road.corridor_id, etc.
+    """
+
+    def __init__(self,
+                 roads: Dict[int, 'RoadSegment'],
+                 road_layer: QgsVectorLayer,
+                 dist_calc: 'DistanceCalculator',
+                 logger: 'PerformanceLogger',
+                 snap_tol: float = TOPOLOGY_SNAP_TOLERANCE):
+        self.roads      = roads
+        self.road_layer = road_layer
+        self.dist_calc  = dist_calc
+        self.logger     = logger
+        self.snap_tol   = snap_tol
+
+        # Internal node registry
+        self._nodes: Dict[int, Dict] = {}   # nid -> {'point': QgsPointXY, 'edges': set()}
+        self._node_idx = QgsSpatialIndex()
+        self._next_nid: int = 0
+
+        # Internal edge registry (one entry per road segment)
+        # edge -> {'start': nid, 'end': nid, 'bearing': float, 'length': float}
+        self._edges: Dict[int, Dict] = {}
+
+        # Public: weighted adjacency list for topology-aware Dijkstra
+        # adj[nid] = [(neighbor_nid, road_id, weight), ...]
+        self.adj: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+
+        # Public: nid -> QgsPointXY (for path reconstruction)
+        self.node_points: Dict[int, QgsPointXY] = {}
+
+        # Topology violation log
+        self.violations: List[Dict] = []
+
+        # Bearing cache: (node_id, road_id) → departure bearing in degrees (0=East CCW)
+        # Populated during _build_weighted_adj, consumed by _turn_penalty in Dijkstra.
+        self._node_road_bearing: Dict[Tuple[int, int], float] = {}
+
+        # Count of virtual connector edges injected for OSM gap healing
+        self._virtual_edge_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Node-registry helpers
+    # ------------------------------------------------------------------
+
+    def _get_or_create_node(self, point: QgsPointXY) -> int:
+        """Return node-id for *point*, snapping to an existing node if within
+        *snap_tol* metres.  Creates a new node otherwise."""
+        if self._next_nid > 0:
+            candidates = self._node_idx.nearestNeighbor(point, 1)
+            if candidates:
+                nid = candidates[0]
+                existing = self._nodes[nid]['point']
+                if self.dist_calc.distance_points(point, existing) <= self.snap_tol:
+                    return nid
+        nid = self._next_nid
+        self._next_nid += 1
+        self._nodes[nid] = {'point': point, 'edges': set()}
+        self.node_points[nid] = point
+        feat = QgsFeature(nid)
+        feat.setGeometry(QgsGeometry.fromPointXY(point))
+        self._node_idx.addFeature(feat)
+        return nid
+
+    def _node_degree(self, nid: int) -> int:
+        return len(self._nodes[nid]['edges'])
+
+    # ------------------------------------------------------------------
+    # Step 1 – build raw graph
+    # ------------------------------------------------------------------
+
+    def _build_raw_graph(self) -> None:
+        """Create one node per unique endpoint and one edge per road segment."""
+        for road_id, road in self.roads.items():
+            if not road.geometry or road.geometry.isEmpty():
+                continue
+            verts = _road_vertices(road.geometry)
+            if len(verts) < 2:
+                continue
+            sn = self._get_or_create_node(verts[0])
+            en = self._get_or_create_node(verts[-1])
+            self._nodes[sn]['edges'].add(road_id)
+            self._nodes[en]['edges'].add(road_id)
+            self._edges[road_id] = {
+                'start':   sn,
+                'end':     en,
+                'bearing': self._road_bearing(verts),
+                'length':  road.length,
+            }
+        self.logger.log(
+            f"Topology: raw graph — {self._next_nid} nodes, {len(self._edges)} edges")
+
+    # ------------------------------------------------------------------
+    # Step 2 – snap dangling endpoints
+    # ------------------------------------------------------------------
+
+    def _snap_dangling_endpoints(self) -> None:
+        """Merge degree-1 nodes that are near (but not at) another node.
+
+        This heals the classic OSM Nigeria defect where a road nearly-but-not-
+        quite touches a junction, leaving a gap in the routing graph that
+        would otherwise force the cable router to fall back to a straight line.
+        """
+        snapped = 0
+        for nid, ndata in list(self._nodes.items()):
+            if len(ndata['edges']) != 1:
+                continue            # not dangling
+            pt = ndata['point']
+            candidates = self._node_idx.nearestNeighbor(pt, 4)
+            for cnid in candidates:
+                if cnid == nid:
+                    continue
+                cpt = self._nodes[cnid]['point']
+                d = self.dist_calc.distance_points(pt, cpt)
+                if 0 < d <= self.snap_tol:
+                    # Merge nid → cnid
+                    for eid in list(ndata['edges']):
+                        edge = self._edges.get(eid)
+                        if edge is None:
+                            continue
+                        road = self.roads.get(eid)
+                        if edge['start'] == nid:
+                            edge['start'] = cnid
+                            if road:
+                                road.snapped_start = cpt
+                        elif edge['end'] == nid:
+                            edge['end'] = cnid
+                            if road:
+                                road.snapped_end = cpt
+                        self._nodes[cnid]['edges'].add(eid)
+                    ndata['edges'].clear()
+                    snapped += 1
+                    break
+        if snapped:
+            self.logger.log(f"Topology: snapped {snapped} dangling endpoint(s)")
+            self.violations.append({
+                'type': 'DANGLING_ENDPOINTS', 'count': snapped,
+                'severity': 'REPAIRED',
+                'message': f'{snapped} near-miss road endpoint(s) snapped and merged.',
+            })
+
+    # ------------------------------------------------------------------
+    # Step 3 – detect dead-ends
+    # ------------------------------------------------------------------
+
+    def _detect_dead_ends(self) -> None:
+        """Mark every road segment that terminates at a degree-1 node.
+
+        The *junction end* (the high-degree endpoint) is stored on the
+        RoadSegment so assign_wings_per_fdt() can anchor the FDT there
+        and cascade FATs outward into the dead-end arm.
+        """
+        dead = 0
+        for road_id, edge in self._edges.items():
+            road = self.roads.get(road_id)
+            if road is None:
+                continue
+            sn, en     = edge['start'], edge['end']
+            s_deg      = self._node_degree(sn)
+            e_deg      = self._node_degree(en)
+            if s_deg == 1 or e_deg == 1:
+                road.is_dead_end = True
+                dead += 1
+                # Junction end = the node with the higher degree
+                road.dead_end_junction_pt = (
+                    self._nodes[sn]['point'] if s_deg >= e_deg
+                    else self._nodes[en]['point']
+                )
+        self.logger.log(f"Topology: {dead} dead-end road arm(s) detected")
+
+    # ------------------------------------------------------------------
+    # Step 4 – corridor chains (angular continuity)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _road_bearing(vertices: List[QgsPointXY]) -> float:
+        """Overall bearing (degrees, 0-360) from first to last vertex."""
+        if len(vertices) < 2:
+            return 0.0
+        dx = vertices[-1].x() - vertices[0].x()
+        dy = vertices[-1].y() - vertices[0].y()
+        return math.degrees(math.atan2(dx, dy)) % 360.0
+
+    @staticmethod
+    def _bearing_diff(b1: float, b2: float) -> float:
+        """Smallest angular difference between two bearings (0–180°)."""
+        d = abs(b1 - b2) % 360.0
+        return min(d, 360.0 - d)
+
+    def _build_corridors(self) -> None:
+        """Group road segments into topological corridors.
+
+        A corridor is a chain of segments where each transition at a degree-2
+        node deviates by less than CORRIDOR_ANGLE_THRESHOLD degrees.  Junctions
+        (degree ≥ 3) and dead-end termini (degree == 1) break corridor chains.
+        """
+        assigned: Set[int] = set()
+        corridor_id = 0
+
+        for seed_id in sorted(self._edges.keys()):
+            if seed_id in assigned:
+                continue
+            corridor: List[int] = [seed_id]
+            assigned.add(seed_id)
+
+            for direction in ('forward', 'backward'):
+                edge        = self._edges[seed_id]
+                cur_road_id = seed_id
+                cur_bearing = edge['bearing']
+                cur_node    = edge['end'] if direction == 'forward' else edge['start']
+
+                for _ in range(100_000):               # safety hard cap
+                    if self._node_degree(cur_node) != 2:
+                        break                          # junction or terminus
+                    # Find the other road connected to cur_node
+                    next_rid = None
+                    for rid in self._nodes[cur_node]['edges']:
+                        if rid != cur_road_id and rid not in assigned:
+                            next_rid = rid
+                            break
+                    if next_rid is None:
+                        break
+
+                    next_edge    = self._edges[next_rid]
+                    next_bearing = next_edge['bearing']
+                    diff         = self._bearing_diff(cur_bearing, next_bearing)
+                    # Accept straight continuation or U-bend (< threshold or near 180°)
+                    if CORRIDOR_ANGLE_THRESHOLD < diff < (180.0 - CORRIDOR_ANGLE_THRESHOLD):
+                        break                          # too sharp a turn
+
+                    corridor.append(next_rid)
+                    assigned.add(next_rid)
+                    cur_road_id = next_rid
+                    cur_bearing = next_bearing
+                    cur_node    = (next_edge['end']
+                                   if next_edge['start'] == cur_node
+                                   else next_edge['start'])
+
+            for rid in corridor:
+                road = self.roads.get(rid)
+                if road:
+                    road.corridor_id = corridor_id
+            corridor_id += 1
+
+        self.logger.log(f"Topology: {corridor_id} corridor chain(s) identified")
+
+    # ------------------------------------------------------------------
+    # Step 5 – dual-carriageway detection
+    # ------------------------------------------------------------------
+
+    def _detect_dual_carriageways(self) -> None:
+        """Identify paired road segments that form a divided dual carriageway.
+
+        Detection criteria (all must hold):
+          • Midpoints are laterally within DUAL_CW_MAX_SEPARATION metres.
+          • Bearings differ by less than DUAL_CW_BEARING_TOLERANCE degrees
+            (or are nearly anti-parallel — i.e. differ by ≈ 180°).
+          • Neither segment is already flagged as a dead-end.
+          • Length ratio ≥ DUAL_CW_MIN_LENGTH_RATIO (avoids false matches
+            between a long trunk road and a short slip road).
+
+        Paired roads get road_class = DUAL_CARRIAGEWAY and each stores the
+        other's road_id in dual_cw_partner.  Downstream logic uses this to
+        forbid FAT borrowing across the median.
+        """
+        # Build midpoint spatial index
+        mid_idx  = QgsSpatialIndex()
+        mid_pts: Dict[int, QgsPointXY] = {}
+        live_ids = [rid for rid in self._edges
+                    if self.roads.get(rid) and not self.roads[rid].is_dead_end]
+
+        for rid in live_ids:
+            road = self.roads[rid]
+            if road.geometry and not road.geometry.isEmpty():
+                mp = road.geometry.centroid().asPoint()
+                mid_pts[rid] = mp
+                feat = QgsFeature(rid)
+                feat.setGeometry(QgsGeometry.fromPointXY(mp))
+                mid_idx.addFeature(feat)
+
+        paired: Set[int] = set()
+        pairs  = 0
+
+        for rid in live_ids:
+            if rid in paired:
+                continue
+            road = self.roads.get(rid)
+            if not road:
+                continue
+            mp   = mid_pts.get(rid)
+            if not mp:
+                continue
+            brg  = self._edges[rid]['bearing']
+            ln   = road.length
+            if ln <= 0:
+                continue
+
+            for cid in mid_idx.nearestNeighbor(mp, 10):
+                if cid == rid or cid in paired:
+                    continue
+                croad = self.roads.get(cid)
+                if not croad or croad.is_dead_end:
+                    continue
+                cmp = mid_pts.get(cid)
+                if not cmp:
+                    continue
+
+                # Lateral separation
+                sep = self.dist_calc.distance_points(mp, cmp)
+                if sep < 3.0 or sep > DUAL_CW_MAX_SEPARATION:
+                    continue
+
+                # Bearing similarity (parallel or anti-parallel)
+                diff = self._bearing_diff(brg, self._edges[cid]['bearing'])
+                if diff > DUAL_CW_BEARING_TOLERANCE and diff < (180.0 - DUAL_CW_BEARING_TOLERANCE):
+                    continue
+
+                # Length ratio
+                cln = croad.length
+                if cln <= 0:
+                    continue
+                ratio = min(ln, cln) / max(ln, cln)
+                if ratio < DUAL_CW_MIN_LENGTH_RATIO:
+                    continue
+
+                # Mark pair
+                road.dual_cw_partner   = cid
+                road.road_class        = RoadClass.DUAL_CARRIAGEWAY
+                croad.dual_cw_partner  = rid
+                croad.road_class       = RoadClass.DUAL_CARRIAGEWAY
+                paired.add(rid)
+                paired.add(cid)
+                pairs += 1
+                break
+
+        self.logger.log(f"Topology: {pairs} dual-carriageway pair(s) detected")
+
+    # ------------------------------------------------------------------
+    # Step 6 – hierarchy inference
+    # ------------------------------------------------------------------
+
+    def _find_osm_highway_field(self) -> Optional[str]:
+        """Return the name of the OSM highway classification field, if present."""
+        field_names = [f.name() for f in self.road_layer.fields()]
+        lower_map   = {n.lower(): n for n in field_names}
+        for cand in ('highway', 'fclass', 'road_type', 'type',
+                     'classification', 'road_class'):
+            if cand in lower_map:
+                return lower_map[cand]
+        return None
+
+    def _infer_hierarchy(self) -> None:
+        """Classify every road segment using OSM tags + topology signals.
+
+        Priority order:
+          1. Already classified as DUAL_CARRIAGEWAY or DEAD_END  → keep.
+          2. Valid OSM highway=* tag                              → direct mapping.
+          3. Topology-based inference via degree + corridor-length scoring.
+
+        Topology scoring (each component 0–1):
+          • degree_score  = avg(start_degree, end_degree) / 6   (saturates at 6)
+          • length_score  = corridor_total_length / 1000 m      (saturates at 1 km)
+          Combined = 0.5 × degree_score + 0.5 × length_score
+            ≥ 0.65  → PRIMARY
+            ≥ 0.40  → SECONDARY
+            ≥ 0.20  → TERTIARY
+            else    → SERVICE
+        """
+        osm_field = self._find_osm_highway_field()
+        osm_tags: Dict[int, str] = {}
+        if osm_field:
+            for feat in self.road_layer.getFeatures():
+                try:
+                    val = str(feat[osm_field] or '').strip().lower()
+                    if val and val not in ('null', 'none', ''):
+                        osm_tags[feat.id()] = val
+                except Exception:
+                    pass
+            self.logger.log(
+                f"Topology: OSM highway field '{osm_field}' — "
+                f"{len(osm_tags)} tag(s) found")
+        else:
+            self.logger.log(
+                "Topology: no OSM highway field found; "
+                "using topology-only hierarchy inference")
+
+        # Pre-compute corridor total lengths
+        corr_len: Dict[int, float] = defaultdict(float)
+        for road in self.roads.values():
+            if road.corridor_id >= 0:
+                corr_len[road.corridor_id] += road.length
+
+        # Node degrees
+        degrees = {nid: self._node_degree(nid) for nid in self._nodes}
+
+        for road_id, road in self.roads.items():
+            # Already classified as dual carriageway by step 5
+            if road.road_class is RoadClass.DUAL_CARRIAGEWAY:
+                continue
+            if road.is_dead_end:
+                road.road_class = RoadClass.DEAD_END
+                continue
+
+            # OSM tag takes priority
+            tag = osm_tags.get(road_id, '')
+            if tag in OSM_HIGHWAY_CLASS_MAP:
+                road.road_class = RoadClass[OSM_HIGHWAY_CLASS_MAP[tag]]
+                continue
+
+            # Topology-based inference
+            edge = self._edges.get(road_id)
+            if edge is None:
+                road.road_class = RoadClass.UNKNOWN
+                continue
+
+            sn, en    = edge['start'], edge['end']
+            avg_deg   = (degrees.get(sn, 0) + degrees.get(en, 0)) / 2.0
+            corr_total = corr_len.get(road.corridor_id, road.length)
+
+            deg_score = min(1.0, avg_deg / 6.0)
+            len_score = min(1.0, corr_total / 1000.0)
+            combined  = 0.5 * deg_score + 0.5 * len_score
+
+            if combined >= 0.65:
+                road.road_class = RoadClass.PRIMARY
+            elif combined >= 0.40:
+                road.road_class = RoadClass.SECONDARY
+            elif combined >= 0.20:
+                road.road_class = RoadClass.TERTIARY
+            else:
+                road.road_class = RoadClass.SERVICE
+
+        # Summary
+        counts: Dict[str, int] = defaultdict(int)
+        for road in self.roads.values():
+            counts[road.road_class.value] += 1
+        self.logger.log(f"Topology: road class distribution — {dict(counts)}")
+
+    # ------------------------------------------------------------------
+    # Step 7 – routing weights
+    # ------------------------------------------------------------------
+
+    def _compute_routing_weights(self) -> None:
+        """Apply ROUTING_WEIGHTS multiplier to every road segment."""
+        for road in self.roads.values():
+            road.routing_weight = ROUTING_WEIGHTS.get(
+                road.road_class.value, ROUTING_WEIGHTS['UNKNOWN'])
+
+    # ------------------------------------------------------------------
+    # Step 8 – build weighted adjacency list
+    # ------------------------------------------------------------------
+
+    def _road_bearing_at_node(self, road_id: int, node_id: int) -> float:
+        """Bearing of departure from node_id along road_id (degrees, 0=East, CCW)."""
+        edge = self._edges.get(road_id, {})
+        road = self.roads.get(road_id)
+        if not road or not road.geometry or road.geometry.isEmpty():
+            return 0.0
+        verts = _road_vertices(road.geometry)
+        if len(verts) < 2:
+            return 0.0
+        p1, p2 = (verts[0], verts[1]) if edge.get('start') == node_id else (verts[-1], verts[-2])
+        dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+        return math.degrees(math.atan2(dy, dx)) % 360.0
+
+    def _turn_penalty(self, node: int, prev_rid: int, next_rid: int) -> float:
+        """Turn-angle penalty (m-equivalent) when routing changes road at *node*.
+
+        *prev_rid* < 0 means we are at the source or just traversed a virtual edge;
+        *next_rid* < 0 means we are about to traverse a virtual edge.
+        Both cases return 0 — virtual hops carry their own penalty in the edge weight.
+        """
+        if prev_rid < 0 or next_rid < 0 or prev_rid == next_rid:
+            return 0.0
+        # Arrival direction at node via prev_rid = opposite of departure bearing
+        b_arrive = (self._node_road_bearing.get((node, prev_rid), 0.0) + 180.0) % 360.0
+        b_depart = self._node_road_bearing.get((node, next_rid), 0.0)
+        angle = abs(b_depart - b_arrive)
+        if angle > 180.0:
+            angle = 360.0 - angle
+        if angle < 30.0:
+            return TURN_PENALTY_SLIGHT
+        if angle < 90.0:
+            return TURN_PENALTY_MODERATE
+        if angle < 150.0:
+            return TURN_PENALTY_SHARP
+        return TURN_PENALTY_REVERSAL
+
+    def _build_weighted_adj(self) -> None:
+        """Build bidirectional adjacency list: adj[nid] = [(nbr, road_id, w)].
+        Also populates _node_road_bearing cache used by _turn_penalty.
+        """
+        self.adj.clear()
+        self._node_road_bearing.clear()
+        for road_id, edge in self._edges.items():
+            road = self.roads.get(road_id)
+            if road is None:
+                continue
+            sn, en = edge['start'], edge['end']
+            w = max(road.length * road.routing_weight, 1e-6)
+            self.adj[sn].append((en, road_id, w))
+            self.adj[en].append((sn, road_id, w))
+            self._node_road_bearing[(sn, road_id)] = self._road_bearing_at_node(road_id, sn)
+            self._node_road_bearing[(en, road_id)] = self._road_bearing_at_node(road_id, en)
+
+    # ------------------------------------------------------------------
+    # Step 9 – topology validation
+    # ------------------------------------------------------------------
+
+    def _validate_topology(self) -> None:
+        """BFS from any node to detect disconnected graph components."""
+        if not self._nodes:
+            return
+        start     = next(iter(self._nodes))
+        visited: Set[int] = set()
+        queue     = [start]
+        while queue:
+            nid = queue.pop()
+            if nid in visited:
+                continue
+            visited.add(nid)
+            for nbr, _, _ in self.adj.get(nid, []):
+                if nbr not in visited:
+                    queue.append(nbr)
+
+        disconnected = len(self._nodes) - len(visited)
+        if disconnected > 0:
+            msg = (f"{disconnected}/{len(self._nodes)} topology nodes are "
+                   f"unreachable from the main network component. "
+                   f"Virtual connector injection will attempt to bridge gaps.")
+            self.logger.log(f"Topology WARNING: {msg}")
+            self.violations.append({
+                'type': 'DISCONNECTED_COMPONENTS',
+                'count': disconnected,
+                'severity': 'WARNING',
+                'message': msg,
+            })
+        else:
+            self.logger.log("Topology: graph fully connected — no isolated components")
+
+    # ------------------------------------------------------------------
+    # Step 10 – virtual connector injection
+    # ------------------------------------------------------------------
+
+    def _inject_virtual_connectors(self) -> None:
+        """Bridge topology gaps ≤ VIRTUAL_CONNECTOR_RADIUS with high-cost virtual edges.
+
+        OSM Nigeria exports commonly have 2–8 m dangling-endpoint gaps that
+        TOPOLOGY_SNAP_TOLERANCE could not heal.  Without virtual connectors,
+        Dijkstra reports the two endpoints as disconnected and routing would need
+        to fall back to a straight line — which crosses buildings and obstacles.
+
+        Virtual edges use road_id = -1 in adj entries so path reconstruction
+        knows to insert a direct micro-hop rather than trace road geometry.
+        Only degree-1 (dangling) and degree-2 (through-segment) nodes are
+        eligible; high-degree junctions (≥ 3 roads) are already well-connected.
+        """
+        if not self._nodes:
+            return
+        seen_pairs: Set[Tuple[int, int]] = set()
+        virtual = 0
+
+        for nid, node_data in self._nodes.items():
+            degree = len(node_data.get('edges', set()))
+            if degree > 2:
+                continue
+            radius = (VIRTUAL_CONNECTOR_RADIUS if degree == 1
+                      else VIRTUAL_CONNECTOR_RADIUS * 0.6)
+            pt = node_data['point']
+            candidates = self._node_idx.nearestNeighbor(pt, 6)
+            for other_nid in candidates:
+                if other_nid == nid:
+                    continue
+                pair = (min(nid, other_nid), max(nid, other_nid))
+                if pair in seen_pairs:
+                    continue
+                already = any(v == other_nid for v, _, _ in self.adj.get(nid, []))
+                if already:
+                    continue
+                other_pt = self._nodes[other_nid]['point']
+                gap = self.dist_calc.distance_points(pt, other_pt)
+                if gap <= radius:
+                    w = gap + VIRTUAL_CONNECTOR_PENALTY
+                    self.adj[nid].append((other_nid, -1, w))
+                    self.adj[other_nid].append((nid, -1, w))
+                    seen_pairs.add(pair)
+                    virtual += 1
+
+        self._virtual_edge_count = virtual
+        if virtual > 0:
+            self.logger.log(
+                f"Topology: injected {virtual} virtual connector edge(s) "
+                f"for OSM gap healing (max gap {VIRTUAL_CONNECTOR_RADIUS}m)")
+
+    # ------------------------------------------------------------------
+    # Public entry-point
+    # ------------------------------------------------------------------
+
+    def analyze(self) -> None:
+        """Execute the full topology analysis pipeline.
+
+        On any internal exception the engine falls back gracefully: every
+        road gets a safe routing_weight so downstream routing can still run.
+        """
+        self.logger.start_module("Road Topology Engine")
+        try:
+            self._build_raw_graph()
+            self._snap_dangling_endpoints()
+            self._detect_dead_ends()
+            self._build_corridors()
+            self._detect_dual_carriageways()
+            self._infer_hierarchy()
+            self._compute_routing_weights()
+            self._build_weighted_adj()
+            self._validate_topology()
+            self._inject_virtual_connectors()
+        except Exception as exc:
+            self.logger.error(f"Topology engine internal error: {exc}")
+            import traceback; traceback.print_exc()
+            # Safe fallback: ensure all roads have a valid weight
+            for road in self.roads.values():
+                if road.routing_weight <= 0:
+                    road.routing_weight = ROUTING_WEIGHTS['UNKNOWN']
+                    road.road_class     = RoadClass.UNKNOWN
+        finally:
+            self.logger.end_module("Road Topology Engine")
+
+    # ------------------------------------------------------------------
+    # Routing helpers (used by CableRouter)
+    # ------------------------------------------------------------------
+
+    def find_node_for_point(self,
+                            point: QgsPointXY,
+                            road_id: Optional[int] = None) -> int:
+        """Return the topology node-id most appropriate for routing from *point*.
+
+        If *road_id* is provided the search is anchored to that road's own
+        endpoints, which prevents cross-road vertex snapping when a device
+        sits slightly offset from its assigned road centre-line.
+        """
+        if road_id is not None and road_id in self._edges:
+            edge = self._edges[road_id]
+            sn, en = edge['start'], edge['end']
+            spt = self._nodes[sn]['point']
+            ept = self._nodes[en]['point']
+            return sn if (self.dist_calc.distance_points(point, spt) <=
+                          self.dist_calc.distance_points(point, ept)) else en
+
+        candidates = self._node_idx.nearestNeighbor(point, 1)
+        return candidates[0] if candidates else -1
+
+    def _road_snap_pt(self, point: QgsPointXY, road_id: int) -> Optional[QgsPointXY]:
+        """Project point onto its road centre-line, returning nearest point on road.
+
+        Used to build road-following stubs so box-to-box cables approach graph
+        nodes along the road surface rather than as a cross-terrain diagonal.
+        """
+        road = self.roads.get(road_id)
+        if not road or not road.geometry or road.geometry.isEmpty():
+            return None
+        pt_geom = QgsGeometry.fromPointXY(point)
+        snapped = road.geometry.nearestPoint(pt_geom)
+        if snapped and not snapped.isEmpty():
+            return snapped.asPoint()
+        return None
+
+    def _road_verts_between_snaps(self, road_id: int,
+                                   snap_a: QgsPointXY,
+                                   snap_b: QgsPointXY) -> List[QgsPointXY]:
+        """Interior road vertices between two snap points, ordered snap_a → snap_b.
+
+        Returns only the vertices that lie strictly between the two projected
+        positions, so the sub-path follows every curve of the road geometry
+        between the two device anchor points.  Used to route same-road FAT→FAT
+        cables without the fan-at-junction artefact.
+        """
+        road = self.roads.get(road_id)
+        if not road or not road.geometry or road.geometry.isEmpty():
+            return []
+        verts = _road_vertices(road.geometry)
+        if len(verts) < 2:
+            return []
+
+        road_geom = road.geometry
+        t_a = road_geom.lineLocatePoint(QgsGeometry.fromPointXY(snap_a))
+        t_b = road_geom.lineLocatePoint(QgsGeometry.fromPointXY(snap_b))
+
+        if t_a <= t_b:
+            return [v for v in verts
+                    if t_a + 1e-3 < road_geom.lineLocatePoint(QgsGeometry.fromPointXY(v)) < t_b - 1e-3]
+        else:
+            mid = [v for v in verts
+                   if t_b + 1e-3 < road_geom.lineLocatePoint(QgsGeometry.fromPointXY(v)) < t_a - 1e-3]
+            return list(reversed(mid))
+
+    def weighted_shortest_path(self,
+                               start_pt:     QgsPointXY,
+                               end_pt:       QgsPointXY,
+                               start_road_id: Optional[int] = None,
+                               end_road_id:   Optional[int] = None,
+                               ) -> Tuple[QgsGeometry, float]:
+        """Topology-aware Dijkstra with turn-penalty and virtual-connector support.
+
+        Never falls back to a straight line.  Callers must check whether the
+        returned geometry is empty (routing failure) and log accordingly.
+
+        Heap state: (cost, node_id, prev_road_id) where prev_road_id = -1
+        at the source or after traversing a virtual connector edge.
+
+        Virtual connector edges (road_id = -1) added by _inject_virtual_connectors
+        bridge small OSM topology gaps; path reconstruction inserts a direct
+        micro-hop for them instead of tracing road geometry.
+        """
+        def _fail() -> Tuple[QgsGeometry, float]:
+            return QgsGeometry(), 0.0
+
+        if not self.adj:
+            return _fail()
+
+        sn = self.find_node_for_point(start_pt, start_road_id)
+        en = self.find_node_for_point(end_pt,   end_road_id)
+
+        if sn < 0 or en < 0:
+            return _fail()
+
+        # Snap both devices to their own roads so all stubs are short and
+        # near-perpendicular to the road rather than long cross-terrain diagonals.
+        start_snap = (self._road_snap_pt(start_pt, start_road_id)
+                      if start_road_id is not None else None)
+        end_snap   = (self._road_snap_pt(end_pt, end_road_id)
+                      if end_road_id is not None else None)
+
+        if sn == en:
+            # Both devices anchor to the same graph node.
+            if (start_road_id is not None and start_road_id == end_road_id
+                    and start_snap is not None and end_snap is not None):
+                # Same road: route through road geometry to eliminate the
+                # fan-at-junction artefact where all FATs on a road converge
+                # on one endpoint via straight-line diagonals.
+                mid_verts = self._road_verts_between_snaps(
+                    start_road_id, start_snap, end_snap)
+                pts = _dedupe_points(
+                    [start_pt, start_snap] + mid_verts + [end_snap, end_pt])
+                if len(pts) >= 2:
+                    dist = sum(
+                        self.dist_calc.distance_points(pts[i], pts[i + 1])
+                        for i in range(len(pts) - 1)
+                    )
+                    return QgsGeometry.fromPolylineXY(pts), dist
+            # Different roads sharing a junction node: route through snap
+            # points and the shared node to stay near both road surfaces.
+            sn_pt = self.node_points.get(sn)
+            if sn_pt:
+                s = start_snap or start_pt
+                e = end_snap   or end_pt
+                pts = _dedupe_points([start_pt, s, sn_pt, e, end_pt])
+                if len(pts) >= 2:
+                    dist = sum(
+                        self.dist_calc.distance_points(pts[i], pts[i + 1])
+                        for i in range(len(pts) - 1)
+                    )
+                    return QgsGeometry.fromPolylineXY(pts), dist
+            return _fail()
+
+        # ── Dijkstra with turn-penalty ───────────────────────────────────
+        # Heap state: (cost, node_id, prev_road_id)
+        # Using an integer tie-breaker avoids comparing road_ids when costs tie.
+        dist_map: Dict[int, float]                     = {sn: 0.0}
+        prev_map: Dict[int, Optional[Tuple[int, int]]] = {sn: None}
+        tie_seq: int                                   = 0
+        heap: List[Tuple[float, int, int, int]]        = [(0.0, 0, sn, -1)]
+        visited: Set[int]                              = set()
+
+        while heap:
+            d, _, u, prev_rid = heapq.heappop(heap)
+            if u in visited:
+                continue
+            visited.add(u)
+            if u == en:
+                break
+            for v, rid, w in self.adj.get(u, []):
+                tp  = self._turn_penalty(u, prev_rid, rid)
+                nd  = d + w + tp
+                if v not in dist_map or nd < dist_map[v]:
+                    dist_map[v] = nd
+                    prev_map[v] = (u, rid)
+                    tie_seq += 1
+                    heapq.heappush(heap, (nd, tie_seq, v, rid))
+
+        if en not in dist_map:
+            return _fail()   # genuinely disconnected — NO straight-line fallback
+
+        # ── Reconstruct road sequence ────────────────────────────────────
+        road_seq: List[Tuple[int, int, int]] = []
+        cur = en
+        while True:
+            entry = prev_map.get(cur)
+            if entry is None:
+                break
+            from_nid, rid = entry
+            road_seq.append((from_nid, cur, rid))
+            cur = from_nid
+        road_seq.reverse()
+
+        # ── Build path geometry with actual road-segment vertices ────────
+        all_pts: List[QgsPointXY] = [start_pt]
+        # Road-following start stub: device → road_snap → graph_node.
+        # The snap point keeps the first segment perpendicular to the road
+        # (≤ SNAP_OFFSET_DISTANCE), so the cable enters the road network at the
+        # correct surface point rather than cutting across as a long diagonal.
+        if start_snap is not None:
+            all_pts.append(start_snap)
+        sn_pt = self.node_points.get(sn)
+        if sn_pt:
+            all_pts.append(sn_pt)
+        for from_n, to_n, rid in road_seq:
+            if rid < 0:
+                # Virtual connector hop — insert node point as micro-stub
+                vp = self.node_points.get(to_n)
+                if vp:
+                    all_pts.append(vp)
+                continue
+            road = self.roads.get(rid)
+            if road and road.geometry and not road.geometry.isEmpty():
+                verts = _road_vertices(road.geometry)
+                if len(verts) >= 2:
+                    edge = self._edges.get(rid, {})
+                    if edge.get('start') == from_n:
+                        all_pts.extend(verts[1:])
+                    else:
+                        all_pts.extend(list(reversed(verts))[1:])
+            else:
+                tp_pt = self.node_points.get(to_n)
+                if tp_pt:
+                    all_pts.append(tp_pt)
+
+        # Road-following end stub: graph_node → road_snap → device.
+        # Mirrors the start stub so the cable exits the road network at the
+        # road surface before the final short perpendicular to the device.
+        if end_snap is not None:
+            all_pts.append(end_snap)
+        all_pts.append(end_pt)
+        full = _dedupe_points(all_pts)
+        if len(full) < 2:
+            return _fail()
+        geom = QgsGeometry.fromPolylineXY(full)
+        return geom, geom.length()
+
+
+# =============================================================================
 # ROAD PROCESSING
 # =============================================================================
 
-def process_roads(road_layer: QgsVectorLayer, 
+def process_roads(road_layer: QgsVectorLayer,
                   index_mgr: SpatialIndexManager,
-                  logger: PerformanceLogger) -> Dict[int, RoadSegment]:
-    """Process road layer and build road segments dictionary"""
+                  logger: PerformanceLogger,
+                  dist_calc: Optional['DistanceCalculator'] = None,
+                  ) -> Tuple[Dict[int, 'RoadSegment'], Optional['RoadTopologyEngine']]:
+    """Build road-segment dictionary then run topology analysis.
+
+    Returns
+    -------
+    roads : Dict[int, RoadSegment]
+        One entry per road feature, enriched with topology metadata.
+    topo  : RoadTopologyEngine | None
+        The engine instance (carries the weighted adjacency graph used by
+        CableRouter).  None only when dist_calc is not provided.
+    """
     logger.start_module("Road Processing")
-    
-    roads = {}
-    
+
+    roads: Dict[int, RoadSegment] = {}
+
     # Build spatial index for roads
     index_mgr.build_index(road_layer, cache_geoms=True)
-    
+
     for feat in road_layer.getFeatures():
         geom = feat.geometry()
         if geom and not geom.isEmpty():
@@ -879,11 +1862,27 @@ def process_roads(road_layer: QgsVectorLayer,
                 length=geom.length()
             )
             roads[feat.id()] = road
-    
+
     logger.end_module("Road Processing")
     logger.log(f"Processed {len(roads)} road segments")
-    
-    return roads
+
+    # ── Topology analysis phase ──────────────────────────────────────────
+    topo: Optional[RoadTopologyEngine] = None
+    if dist_calc is not None:
+        topo = RoadTopologyEngine(roads, road_layer, dist_calc, logger)
+        topo.analyze()
+        # Log any violations raised by the engine
+        for v in topo.violations:
+            sev = v.get('severity', 'INFO')
+            msg = v.get('message', str(v))
+            if sev == 'REPAIRED':
+                logger.log(f"[TOPOLOGY REPAIRED] {msg}")
+            else:
+                logger.log(f"[TOPOLOGY {sev}] {msg}")
+    else:
+        logger.log("Topology engine skipped (no dist_calc provided).")
+
+    return roads, topo
 
 # =============================================================================
 # HOMEPASS PROCESSING AND ROAD ASSIGNMENT
@@ -1453,32 +2452,40 @@ def insert_intermediate_fats(start_fat: FAT, end_fat: FAT,
 # WING DETERMINATION
 # =============================================================================
 
-def assign_wings_per_fdt(fdts: List[FDT], logger: PerformanceLogger):
-    """Assign FAT wings per FDT with strictly non-overlapping contiguous zones.
+def assign_wings_per_fdt(fdts: List[FDT],
+                         logger: PerformanceLogger,
+                         roads: Optional[Dict[int, 'RoadSegment']] = None,
+                         dist_calc: Optional['DistanceCalculator'] = None):
+    """Assign FAT wings per FDT with topology-aware, road-class-sensitive layout.
 
-    Wing layout
-    -----------
-    FATs in each FDT are sorted by their road position (cascade_order).
-    They are then split exactly at the midpoint of the sorted list:
+    Standard (non-dead-end) wing layout
+    ------------------------------------
+    FATs are split at the midpoint of the sorted-by-cascade-order list:
 
-      Wing A  –  the LOWER half (road positions before the midpoint)
-                 sorted DESCENDING so A-01 is closest to the FDT boundary
-                 and A-04 is the far end of the chain.
+      Wing A – lower half, reversed  → A-01 closest to FDT boundary, A-04 far end.
+      Wing B – upper half, ascending → B-01 closest to FDT boundary, B-04 far end.
 
-      Wing B  –  the UPPER half (road positions at/after the midpoint)
-                 sorted ASCENDING so B-01 is closest to the FDT boundary
-                 and B-04 is the far end.
+    The FDT is placed at the boundary between Wing A and Wing B.
 
-    The FDT is placed at the BOUNDARY between Wing A and Wing B.
+    Borrowed FATs (cross-road)
+    --------------------------
+    Always inserted at index 0 of their wing (the junction/nearest position).
 
-    Borrowed FATs (from a connected road)
-    --------------------------------------
-    A borrowed FAT belongs to a DIFFERENT road than the FDT's primary road.
-    It must always be placed at index 0 of its wing (= A-01 or B-01), because:
-      - It physically lives at the junction next to the FDT
-      - The cable must run FDT → borrowed_FAT (junction) → primary-road FATs outward
-      - Placing it at the far end (A-04/B-04) would force the cable to travel
-        all the way along the primary road and then jump to another street entirely
+    Dead-end road treatment  ← NEW
+    --------------------------------
+    When the primary road of an FDT is a topological dead-end the standard
+    bilateral split is physically wrong: splitting the FAT chain in two
+    directions implies cable running back through the junction, which is
+    impossible on a dead-end.
+
+    Instead the FDT is anchored to the dead-end's junction point (where the
+    dead-end meets the parent road), and ALL FATs cascade outward in a single
+    direction using Wing B only:
+
+        FDT (at junction) → B-01 → B-02 → B-03 → B-04 (far end of dead-end)
+
+    Wing A is left empty.  The cascade splitter pattern is applied to Wing B
+    positions as normal (1×9, 1×9, 1×9, 1×8).
 
     Cascade chain:
         FDT → A-01 (1×9) → A-02 (1×9) → A-03 (1×9) → A-04 (1×8)
@@ -1507,11 +2514,16 @@ def assign_wings_per_fdt(fdts: List[FDT], logger: PerformanceLogger):
             )
 
         # ----------------------------------------------------------------
-        # Step 1: separate primary-road FATs from borrowed FATs.
-        # Primary road = the road_id shared by the majority of FATs.
+        # Step 1: resolve primary road.
+        # Use fdt.primary_road_id set by the walk-forward grouper (exact),
+        # falling back to majority vote only when the field is absent.
         # ----------------------------------------------------------------
         from collections import Counter as _Counter
-        primary_road_id = _Counter(f.road_id for f in all_fats).most_common(1)[0][0]
+        primary_road_id = (
+            fdt.primary_road_id
+            if fdt.primary_road_id is not None
+            else _Counter(f.road_id for f in all_fats).most_common(1)[0][0]
+        )
 
         primary_fats = sorted(
             [f for f in all_fats if f.road_id == primary_road_id],
@@ -1523,63 +2535,157 @@ def assign_wings_per_fdt(fdts: List[FDT], logger: PerformanceLogger):
         )
 
         # ----------------------------------------------------------------
-        # Step 2: split primary FATs exactly at the midpoint.
-        # Lower half → Wing A (reversed: closest to FDT boundary at [0])
-        # Upper half → Wing B (ascending: closest to FDT boundary at [0])
+        # Step 2: dead-end single-direction layout.
+        #
+        # When the primary road is a topological dead-end the bilateral
+        # wing split is physically impossible — there is no "behind the FDT"
+        # direction.  Instead:
+        #   • FDT is anchored to the junction point (where the dead-end
+        #     meets the parent road network).
+        #   • ALL primary FATs are placed in Wing B, ordered by distance
+        #     from the junction outward (B-01 = closest to junction).
+        #   • Wing A is left empty.
+        #   • Borrowed FATs are prepended to Wing B as normal.
         # ----------------------------------------------------------------
-        split = len(primary_fats) // 2
-        wing_a = list(reversed(primary_fats[:split]))   # [0]=closest, [-1]=farthest
-        wing_b = list(primary_fats[split:])             # [0]=closest, [-1]=farthest
+        primary_road_obj  = roads.get(primary_road_id) if roads else None
+        is_dead_end_fdt   = (primary_road_obj is not None and
+                             primary_road_obj.is_dead_end and
+                             primary_road_obj.dead_end_junction_pt is not None)
 
-        # ----------------------------------------------------------------
-        # Step 3: insert borrowed FATs at the FRONT of their wing.
-        #
-        # A borrowed FAT is physically at the junction between roads, so it
-        # is always the FIRST hop from the FDT.  Inserting at index 0 means:
-        #   FDT → borrowed_FAT (A-01) → primary_road_FAT_closest (A-02) → ...
-        #
-        # Distribute borrowed FATs one at a time to the shorter wing,
-        # inserting each at index 0 (shifting primary FATs to higher indices).
-        # ----------------------------------------------------------------
-        if borrowed_fats:
-            # Sort borrowed FATs by distance to the FDT boundary midpoint
-            if wing_a and wing_b:
-                bx = (wing_a[0].geometry.x() + wing_b[0].geometry.x()) / 2
-                by = (wing_a[0].geometry.y() + wing_b[0].geometry.y()) / 2
-            elif wing_a:
-                bx, by = wing_a[0].geometry.x(), wing_a[0].geometry.y()
-            elif wing_b:
-                bx, by = wing_b[0].geometry.x(), wing_b[0].geometry.y()
+        if is_dead_end_fdt:
+            junction_pt = primary_road_obj.dead_end_junction_pt
+
+            # Sort primary FATs nearest-to-junction first
+            if dist_calc is not None:
+                primary_fats.sort(
+                    key=lambda f: dist_calc.distance_points(f.geometry, junction_pt)
+                )
             else:
-                bx = sum(f.geometry.x() for f in borrowed_fats) / len(borrowed_fats)
-                by = sum(f.geometry.y() for f in borrowed_fats) / len(borrowed_fats)
+                primary_fats.sort(
+                    key=lambda f: (f.geometry.x() - junction_pt.x()) ** 2 +
+                                  (f.geometry.y() - junction_pt.y()) ** 2
+                )
 
-            borrowed_fats.sort(key=lambda f:
-                (f.geometry.x() - bx) ** 2 + (f.geometry.y() - by) ** 2
+            wing_a = []
+            wing_b = list(primary_fats)          # all FATs cascade outward into dead-end
+
+            # Prepend borrowed FATs at the front (they sit at the junction too)
+            for fat in reversed(borrowed_fats):
+                wing_b.insert(0, fat)
+
+            # Hard-cap Wing B; any overflow goes to Wing A as last resort
+            while len(wing_b) > MAX_FAT_PER_WING:
+                wing_a.insert(0, wing_b.pop())   # move farthest FAT to Wing A
+
+            # Anchor FDT at the junction point
+            fdt.geometry = junction_pt
+            logger.log(
+                f"{fdt_code}: dead-end layout — FDT anchored at junction, "
+                f"B:{len(wing_b)} FATs outward, A:{len(wing_a)} overflow"
             )
-            for fat in borrowed_fats:
-                # Always insert at index 0 so this FAT is the first hop (A-01/B-01)
-                if len(wing_a) <= len(wing_b):
-                    wing_a.insert(0, fat)
+
+        else:
+            # ----------------------------------------------------------------
+            # Step 2 (standard): split primary FATs exactly at the midpoint.
+            # Lower half → Wing A (reversed: closest to FDT boundary at [0])
+            # Upper half → Wing B (ascending: closest to FDT boundary at [0])
+            # ----------------------------------------------------------------
+            split  = len(primary_fats) // 2
+            wing_a = list(reversed(primary_fats[:split]))
+            wing_b = list(primary_fats[split:])
+
+            # Record the two primary-road FATs that straddle the wing boundary
+            # NOW, before borrowed FATs are prepended at index 0 of each wing.
+            # These are the only FATs valid for computing the FDT road position.
+            _boundary_a = primary_fats[split - 1] if split > 0              else None
+            _boundary_b = primary_fats[split]     if split < len(primary_fats) else None
+
+            # ----------------------------------------------------------------
+            # Step 3: insert borrowed FATs at the FRONT of their wing.
+            # ----------------------------------------------------------------
+            if borrowed_fats:
+                if wing_a and wing_b:
+                    bx = (wing_a[0].geometry.x() + wing_b[0].geometry.x()) / 2
+                    by = (wing_a[0].geometry.y() + wing_b[0].geometry.y()) / 2
+                elif wing_a:
+                    bx, by = wing_a[0].geometry.x(), wing_a[0].geometry.y()
+                elif wing_b:
+                    bx, by = wing_b[0].geometry.x(), wing_b[0].geometry.y()
                 else:
-                    wing_b.insert(0, fat)
+                    bx = sum(f.geometry.x() for f in borrowed_fats) / len(borrowed_fats)
+                    by = sum(f.geometry.y() for f in borrowed_fats) / len(borrowed_fats)
 
-        # ----------------------------------------------------------------
-        # Step 4: enforce MAX_FAT_PER_WING.
-        # If a wing is still too long, move its LAST element (farthest primary
-        # road FAT) to the end of the other wing — never move index 0 which
-        # could be a borrowed FAT placed at the junction.
-        # ----------------------------------------------------------------
-        while len(wing_a) > MAX_FAT_PER_WING and len(wing_b) < MAX_FAT_PER_WING:
-            wing_b.append(wing_a.pop())    # pop() = last element = farthest primary FAT
-        while len(wing_b) > MAX_FAT_PER_WING and len(wing_a) < MAX_FAT_PER_WING:
-            wing_a.append(wing_b.pop())
+                borrowed_fats.sort(
+                    key=lambda f: (f.geometry.x() - bx) ** 2 +
+                                  (f.geometry.y() - by) ** 2
+                )
+                for fat in borrowed_fats:
+                    if len(wing_a) <= len(wing_b):
+                        wing_a.insert(0, fat)
+                    else:
+                        wing_b.insert(0, fat)
 
-        if len(wing_a) > MAX_FAT_PER_WING or len(wing_b) > MAX_FAT_PER_WING:
-            raise ValidationError(
-                f"{fdt_code}: wing overflow after rebalance "
-                f"A={len(wing_a)}, B={len(wing_b)}"
-            )
+            # ----------------------------------------------------------------
+            # Step 4: enforce MAX_FAT_PER_WING.
+            # ----------------------------------------------------------------
+            while len(wing_a) > MAX_FAT_PER_WING and len(wing_b) < MAX_FAT_PER_WING:
+                wing_b.append(wing_a.pop())
+            while len(wing_b) > MAX_FAT_PER_WING and len(wing_a) < MAX_FAT_PER_WING:
+                wing_a.append(wing_b.pop())
+
+            if len(wing_a) > MAX_FAT_PER_WING or len(wing_b) > MAX_FAT_PER_WING:
+                raise ValidationError(
+                    f"{fdt_code}: wing overflow after rebalance "
+                    f"A={len(wing_a)}, B={len(wing_b)}"
+                )
+
+            # Place FDT at the road-interpolated midpoint between the two
+            # primary-road boundary FATs.  Using wing_a[0]/wing_b[0] here
+            # is wrong when borrowed FATs have been prepended at index 0 —
+            # their side-street coordinates pull the midpoint off the road.
+            # Instead we interpolate along the primary road geometry between
+            # the saved boundary positions, guaranteeing an on-road result.
+            _placed = False
+            if (primary_road_obj is not None
+                    and not primary_road_obj.geometry.isEmpty()):
+                _rg  = primary_road_obj.geometry
+                _rlen = _rg.length()
+                if _rlen > 0:
+                    if _boundary_a and _boundary_b:
+                        _ta = _rg.lineLocatePoint(
+                            QgsGeometry.fromPointXY(_boundary_a.geometry))
+                        _tb = _rg.lineLocatePoint(
+                            QgsGeometry.fromPointXY(_boundary_b.geometry))
+                        _mg = _rg.interpolate((_ta + _tb) / 2)
+                        if _mg and not _mg.isEmpty():
+                            fdt.geometry = _mg.asPoint()
+                            _placed = True
+                    elif _boundary_b:
+                        _sn = _rg.nearestPoint(
+                            QgsGeometry.fromPointXY(_boundary_b.geometry))
+                        if _sn and not _sn.isEmpty():
+                            fdt.geometry = _sn.asPoint()
+                            _placed = True
+                    elif _boundary_a:
+                        _sn = _rg.nearestPoint(
+                            QgsGeometry.fromPointXY(_boundary_a.geometry))
+                        if _sn and not _sn.isEmpty():
+                            fdt.geometry = _sn.asPoint()
+                            _placed = True
+            if not _placed:
+                if _boundary_a and _boundary_b:
+                    fdt.geometry = QgsPointXY(
+                        (_boundary_a.geometry.x() + _boundary_b.geometry.x()) / 2,
+                        (_boundary_a.geometry.y() + _boundary_b.geometry.y()) / 2,
+                    )
+                elif _boundary_b:
+                    fdt.geometry = _boundary_b.geometry
+                elif _boundary_a:
+                    fdt.geometry = _boundary_a.geometry
+                elif wing_a:
+                    fdt.geometry = wing_a[0].geometry
+                elif wing_b:
+                    fdt.geometry = wing_b[0].geometry
 
         # ----------------------------------------------------------------
         # Step 5: assign names, sequence numbers, wing labels.
@@ -1599,17 +2705,6 @@ def assign_wings_per_fdt(fdts: List[FDT], logger: PerformanceLogger):
         fdt.wing_a_count = len(wing_a)
         fdt.wing_b_count = len(wing_b)
         fdt.fats         = wing_a + wing_b
-
-        # Place FDT geometry at the midpoint between the two closest FATs
-        if wing_a and wing_b:
-            fdt.geometry = QgsPointXY(
-                (wing_a[0].geometry.x() + wing_b[0].geometry.x()) / 2,
-                (wing_a[0].geometry.y() + wing_b[0].geometry.y()) / 2
-            )
-        elif wing_a:
-            fdt.geometry = wing_a[0].geometry
-        elif wing_b:
-            fdt.geometry = wing_b[0].geometry
 
         logger.log(
             f"{fdt.name} -> {total_fats} FAT -> A:{len(wing_a)}, B:{len(wing_b)} "
@@ -1721,242 +2816,489 @@ def _get_touching_road_ids(road_id: int, roads: dict, road_index) -> list:
 
 
 def generate_fdts(fats: List[FAT],
-                 error_collector: ErrorCollector,
-                 logger: PerformanceLogger,
-                 roads=None,
-                 road_index=None,
-                 dist_calc=None) -> List[FDT]:
-    """Generate FDTs by clustering FATs, enforcing MIN_FAT_PER_FDT (6) and MAX_FAT_PER_FDT (8).
+                  error_collector: ErrorCollector,
+                  logger: PerformanceLogger,
+                  roads: Optional[Dict[int, 'RoadSegment']] = None,
+                  dist_calc: Optional['DistanceCalculator'] = None,
+                  topo: Optional['RoadTopologyEngine'] = None) -> List[FDT]:
+    """Generate FDTs using a Dead-End-First, Walk-Forward algorithm.
 
     Algorithm
     ---------
-    Phase 1 – per-road grouping
-        Each road's FATs are sorted by cascade_order and sliced into groups of
-        up to MAX_FAT_PER_FDT.  This gives the initial FDT candidates.
-
-    Phase 2 – merge undersized groups
-        Any group with fewer than MIN_FAT_PER_FDT FATs is "deficient".
-        Strategy (in priority order):
-
-        A. Same-road merge: if this road has another group (the last chunk
-           when a road has e.g. 9 FATs → [8, 1]), merge the small tail into
-           the nearest same-road group that is below MAX_FAT_PER_FDT.
-
-        B. Cross-road fill from touching neighbours: for each directly
-           touching road (junction neighbour), look for groups that have
-           MORE than MIN_FAT_PER_FDT FATs (i.e. ≥ 7) and can spare one FAT
-           without going below MIN_FAT_PER_FDT.  Borrow the closest FAT.
-
-        C. Last-resort cross-road merge: if still deficient, find the
-           nearest group on any touching road that, when merged with the
-           deficient group, would not exceed MAX_FAT_PER_FDT.  Merge them
-           into a single group (absorbed group is removed).
-
-        If none of the above fills the group it is logged as truly isolated.
-
-    Phase 3 – build FDT objects from settled groups.
+    Step 0  Index FATs by road and sort by cascade_order.
+    Step 1  Build exact junction topology from topo engine (road_nodes,
+            junction_roads).  Falls back to no-topology mode gracefully.
+    Step 2  Classify dead-end roads:
+            • Self-sufficient (≥ MIN_FAT_PER_FDT FATs) → processed normally.
+            • Non-self-sufficient → absorbed into parent road at junction.
+              Multiple dead-ends at the same junction node are pooled first;
+              if their combined count ≥ MIN they form their own FDT group
+              (Step-2 dual dead-end rule) instead of being injected.
+    Step 3  Group roads by corridor_id; order roads within each corridor
+            by BFS walk using junction topology.
+    Step 4  Walk each corridor (low-rank first) accumulating FATs into a
+            running group and emitting an FDT every time the group hits
+            MAX_FAT_PER_FDT.  Dead-end FATs are injected at their junction
+            position along the parent road using normalised cascade_order.
+    Step 5  At corridor end, if remainder < MIN_FAT_PER_FDT: try to pass
+            overflow to the higher-rank parent corridor at the terminal node.
+            If no viable parent exists: log as isolated and emit anyway.
+    Step 6  Isolated roads (corridor_id == -1) are walked individually.
+    Step 7  Orphaned dead-end FATs (no parent road found) are emitted as
+            isolated groups with an error log entry.
+    Step 8  Build FDT objects; primary_road_id is tracked explicitly
+            (= the road the walk was on when the group opened) — no
+            majority-vote over borrowed FAT road_ids needed.
     """
     logger.start_module("FDT Generation")
-
     if not fats:
         return []
 
-    # ------------------------------------------------------------------
-    # Phase 1: initial per-road grouping
-    # ------------------------------------------------------------------
-    fats_by_road = defaultdict(list)
+    # ── 0. Index and sort FATs by road ───────────────────────────────────
+    fats_by_road: Dict[int, List[FAT]] = defaultdict(list)
     for fat in fats:
         fats_by_road[fat.road_id].append(fat)
+    for rid in fats_by_road:
+        fats_by_road[rid].sort(key=_fat_sort_key)
+    all_fat_road_ids: Set[int] = set(fats_by_road.keys())
 
-    # groups_by_road[road_id] = list of mutable FAT lists
-    groups_by_road: Dict[int, List[List[FAT]]] = {}
-    for road_id in sorted(fats_by_road.keys()):
-        road_fats = sorted(fats_by_road[road_id], key=_fat_sort_key)
-        groups = []
-        for i in range(0, len(road_fats), MAX_FAT_PER_FDT):
-            chunk = road_fats[i:i + MAX_FAT_PER_FDT]
-            if chunk:
-                groups.append(chunk)
-        groups_by_road[road_id] = groups
+    # ── 1. Junction topology ──────────────────────────────────────────────
+    # junction_roads[nid] = set of all road IDs meeting at that node
+    # road_nodes[rid]     = (start_nid, end_nid)
+    junction_roads: Dict[int, Set[int]] = defaultdict(set)
+    road_nodes: Dict[int, Tuple[int, int]] = {}
 
-    # ------------------------------------------------------------------
-    # Phase 2: enforce minimum with targeted, local operations only
-    # ------------------------------------------------------------------
-    if roads and road_index:
+    if topo and topo._edges and topo._nodes:
+        for rid, edge in topo._edges.items():
+            sn, en = edge['start'], edge['end']
+            road_nodes[rid] = (sn, en)
+            junction_roads[sn].add(rid)
+            junction_roads[en].add(rid)
 
-        def _centroid(group):
-            if not group:
-                return None
-            return QgsPointXY(
-                sum(f.geometry.x() for f in group) / len(group),
-                sum(f.geometry.y() for f in group) / len(group)
-            )
+    def _junction_pos(junc_pt: QgsPointXY, road: 'RoadSegment') -> float:
+        """Normalised 0–1 position of junc_pt along road geometry."""
+        if not road or not road.geometry or road.geometry.isEmpty():
+            return 0.5
+        length = road.geometry.length()
+        if length <= 0:
+            return 0.5
+        t = road.geometry.lineLocatePoint(QgsGeometry.fromPointXY(junc_pt))
+        return t / length
 
-        def _dist(group_a, group_b):
-            ca = _centroid(group_a)
-            cb = _centroid(group_b)
-            if ca is None or cb is None:
-                return float('inf')
-            if dist_calc:
-                return dist_calc.distance_points(ca, cb)
-            return ((ca.x() - cb.x()) ** 2 + (ca.y() - cb.y()) ** 2) ** 0.5
+    # ── 2. Dead-end classification ────────────────────────────────────────
+    # Pool ALL non-self-sufficient dead-ends per junction node FIRST, then
+    # decide: combined ≥ MIN → standalone group(s); else inject into parent.
+    junction_de_pool: Dict[int, List[FAT]] = defaultdict(list)   # nid → FATs
+    junction_parent: Dict[int, Optional[int]] = {}               # nid → parent rid
+    absorbed_rids: Set[int] = set()
 
-        def _pt_dist(centroid_pt, fat):
-            if centroid_pt is None:
-                return float('inf')
-            if dist_calc:
-                return dist_calc.distance_points(centroid_pt, fat.geometry)
-            return ((centroid_pt.x() - fat.geometry.x()) ** 2 +
-                    (centroid_pt.y() - fat.geometry.y()) ** 2) ** 0.5
-
-        for _ in range(20):
-            any_changed = False
-
-            # Purge emptied groups before each pass so they are never
-            # accidentally considered as merge or borrow candidates
-            for rid in list(groups_by_road.keys()):
-                groups_by_road[rid] = [g for g in groups_by_road[rid] if g]
-
-            for road_id in sorted(groups_by_road.keys()):
-                for group_idx in range(len(groups_by_road[road_id])):
-                    group = groups_by_road[road_id][group_idx]
-
-                    # Skip empty (already consumed) or already meeting minimum
-                    if not group or len(group) >= MIN_FAT_PER_FDT:
-                        continue
-
-                    logger.log(
-                        f"FDT on road {road_id} group {group_idx}: "
-                        f"{len(group)} FATs, needs {MIN_FAT_PER_FDT - len(group)} more."
-                    )
-
-                    # -- Strategy A: same-road merge --
-                    # Combine with another non-empty group on this road if it fits
-                    same_road_others = [
-                        (gi, g) for gi, g in enumerate(groups_by_road[road_id])
-                        if gi != group_idx
-                        and g                                    # must be non-empty
-                        and len(g) + len(group) <= MAX_FAT_PER_FDT
-                    ]
-                    if same_road_others:
-                        best_gi, best_g = min(same_road_others,
-                                              key=lambda x: _dist(group, x[1]))
-                        group.extend(best_g)
-                        best_g.clear()
-                        any_changed = True
-                        logger.log(
-                            f"  Strategy A: merged same-road group {best_gi} -> "
-                            f"group {group_idx} now has {len(group)} FATs."
-                        )
-                        continue
-
-                    # -- Strategy B: borrow one FAT at a time from touching roads --
-                    touching_ids = _get_touching_road_ids(road_id, roads, road_index)
-                    grp_centroid = _centroid(group)
-
-                    borrow_pool = []
-                    for nb_id in touching_ids:
-                        for nb_gi, nb_g in enumerate(groups_by_road.get(nb_id, [])):
-                            # Only borrow from groups with surplus (> MIN means >= MIN+1 = 7+)
-                            if not nb_g or len(nb_g) <= MIN_FAT_PER_FDT:
-                                continue
-                            for fat in nb_g:
-                                borrow_pool.append(
-                                    (_pt_dist(grp_centroid, fat), nb_id, nb_gi, fat)
-                                )
-
-                    borrow_pool.sort(key=lambda x: x[0])
-
-                    for d, nb_id, nb_gi, fat in borrow_pool:
-                        if len(group) >= MIN_FAT_PER_FDT:
-                            break
-                        nb_g = groups_by_road[nb_id][nb_gi]
-                        if not nb_g or len(nb_g) <= MIN_FAT_PER_FDT:
-                            continue
-                        if fat not in nb_g:
-                            continue
-                        nb_g.remove(fat)
-                        group.append(fat)
-                        any_changed = True
-                        logger.log(
-                            f"  Strategy B: borrowed FAT {fat.name} from "
-                            f"road {nb_id} (dist={d:.1f}m). "
-                            f"Group now {len(group)} FATs."
-                        )
-
-                    if len(group) >= MIN_FAT_PER_FDT:
-                        continue
-
-                    # -- Strategy C: merge entire neighbour group --
-                    merge_pool = []
-                    for nb_id in touching_ids:
-                        for nb_gi, nb_g in enumerate(groups_by_road.get(nb_id, [])):
-                            if not nb_g:
-                                continue
-                            if len(group) + len(nb_g) <= MAX_FAT_PER_FDT:
-                                merge_pool.append((_dist(group, nb_g), nb_id, nb_gi, nb_g))
-
-                    if merge_pool:
-                        merge_pool.sort(key=lambda x: x[0])
-                        _, nb_id, nb_gi, nb_g = merge_pool[0]
-                        group.extend(nb_g)
-                        nb_g.clear()
-                        any_changed = True
-                        logger.log(
-                            f"  Strategy C: merged neighbour group from road {nb_id} "
-                            f"into road {road_id} group {group_idx}. "
-                            f"Group now {len(group)} FATs."
-                        )
-                    elif len(group) < MIN_FAT_PER_FDT:
-                        logger.log(
-                            f"  Road {road_id} group {group_idx}: truly isolated, "
-                            f"only {len(group)} FATs."
-                        )
-                        error_collector.add_error(
-                            "FDT_UNDERFILLED",
-                            f"Road {road_id} group {group_idx}",
-                            f"FDT has {len(group)} FATs, minimum is {MIN_FAT_PER_FDT}."
-                        )
-
-            if not any_changed:
-                break
-
-        # Final purge of emptied groups
-        for road_id in list(groups_by_road.keys()):
-            groups_by_road[road_id] = [g for g in groups_by_road[road_id] if g]
-
-    # ------------------------------------------------------------------
-    # Phase 3: build FDT objects from settled groups
-    # ------------------------------------------------------------------
-    fdts = []
-    fdt_counter = 1
-
-    for road_id in sorted(groups_by_road.keys()):
-        for group in groups_by_road[road_id]:
-            if not group:
+    if roads and topo and topo._nodes:
+        for rid in sorted(all_fat_road_ids):
+            road = roads.get(rid)
+            if not (road and road.is_dead_end):
                 continue
-            if len(group) > MAX_FAT_PER_FDT:
-                raise ValidationError(
-                    f"Road {road_id}: group has {len(group)} FATs, "
-                    f"exceeds MAX_FAT_PER_FDT ({MAX_FAT_PER_FDT})"
-                )
-            fdt = _make_fdt(group, fdt_counter)
-            if fdt.total_customers > MAX_FDT_CAPACITY:
-                raise ValidationError(
-                    f"{fdt.name} has {fdt.total_customers} customers, "
-                    f"exceeds {MAX_FDT_CAPACITY}"
-                )
-            fdts.append(fdt)
+            fat_list = fats_by_road.get(rid, [])
+            if not fat_list or len(fat_list) >= MIN_FAT_PER_FDT:
+                continue  # self-sufficient or no FATs: process normally
+
+            sn, en = road_nodes.get(rid, (None, None))
+            if sn is None:
+                continue  # road absent from topo graph — leave in normal pool
+
+            sn_deg = len(topo._nodes.get(sn, {}).get('edges', set()))
+            en_deg = len(topo._nodes.get(en, {}).get('edges', set()))
+            junc_nid = sn if sn_deg >= en_deg else en
+
+            junction_de_pool[junc_nid].extend(fat_list)
+            absorbed_rids.add(rid)
+
+            if junc_nid not in junction_parent:
+                parent_rid = None
+                for nb_rid in junction_roads.get(junc_nid, set()):
+                    nb_road = roads.get(nb_rid)
+                    if nb_road and not nb_road.is_dead_end and nb_rid != rid:
+                        if nb_rid in all_fat_road_ids and parent_rid is None:
+                            parent_rid = nb_rid
+                        elif parent_rid is None:
+                            parent_rid = nb_rid
+                junction_parent[junc_nid] = parent_rid
+
+    # Remove absorbed dead-ends from normal processing pool
+    for rid in absorbed_rids:
+        fats_by_road.pop(rid, None)
+        all_fat_road_ids.discard(rid)
+
+    # dead_end_inject[parent_rid] = [(position_0_1, fat_list), ...]
+    dead_end_inject: Dict[int, List[Tuple[float, List[FAT]]]] = defaultdict(list)
+    # orphan_pending[nid] = FATs with no identifiable parent
+    orphan_pending: Dict[int, List[FAT]] = defaultdict(list)
+    # result_groups is built up throughout; finalised in step 8
+    result_groups: List[Tuple[List[FAT], int]] = []
+
+    for junc_nid, pool in junction_de_pool.items():
+        if not pool:
+            continue
+        parent_rid = junction_parent.get(junc_nid)
+
+        if len(pool) >= MIN_FAT_PER_FDT:
+            # Step-2 dual dead-end rule: emit standalone group(s) at junction
+            p_primary = pool[0].road_id
+            for i in range(0, len(pool), MAX_FAT_PER_FDT):
+                chunk = pool[i:i + MAX_FAT_PER_FDT]
+                if chunk:
+                    result_groups.append((chunk, p_primary))
+                    logger.log(
+                        f"Dead-end junction {junc_nid}: {len(chunk)} combined "
+                        f"FATs → standalone FDT group")
+        elif parent_rid is not None and parent_rid in all_fat_road_ids:
+            parent_road = roads.get(parent_rid) if roads else None
+            junc_pt = topo._nodes[junc_nid]['point']
+            pos = _junction_pos(junc_pt, parent_road)
+            dead_end_inject[parent_rid].append((pos, list(pool)))
             logger.log(
-                f"Road {road_id} -> {fdt.name} "
-                f"({fdt.total_fat} FAT, {fdt.total_customers} customers)"
-            )
-            fdt_counter += 1
+                f"Dead-end junction {junc_nid}: {len(pool)} FATs absorbed "
+                f"into road {parent_rid} at pos {pos:.2f}")
+        else:
+            orphan_pending[junc_nid].extend(pool)
+            logger.log(
+                f"Dead-end junction {junc_nid}: {len(pool)} FATs orphaned "
+                f"(no parent road with FATs found)")
+
+    # ── 3. Build spanning tree over all roads with FATs ─────────────────────
+    # BFS from the highest-rank road in each connected component establishes
+    # parent→child relationships.  Processing in REVERSE BFS order (leaves
+    # first, root last) means every road passes its unavoidable remainder up
+    # to its parent, so FATs accumulate continuously with no corridor
+    # boundaries breaking the flow.
+
+    _rank: Dict[RoadClass, int] = {
+        RoadClass.SERVICE: 0, RoadClass.UNKNOWN: 1, RoadClass.DEAD_END: 2,
+        RoadClass.TERTIARY: 3, RoadClass.DUAL_CARRIAGEWAY: 4,
+        RoadClass.SECONDARY: 4, RoadClass.PRIMARY: 5,
+    }
+
+    def _road_rank(rid: int) -> int:
+        road = roads.get(rid) if roads else None
+        return _rank.get(road.road_class, 1) if road else 1
+
+    parent_of: Dict[int, Optional[int]] = {}   # rid → parent rid (None = root)
+    process_order: List[int] = []              # BFS order (root first)
+
+    visited_tree: Set[int] = set()
+    # Seed BFS from highest-rank roads so they become roots / parents
+    for start_rid in sorted(all_fat_road_ids, key=_road_rank, reverse=True):
+        if start_rid in visited_tree:
+            continue
+        bfs_q: List[int] = [start_rid]
+        parent_of[start_rid] = None
+        visited_tree.add(start_rid)
+        while bfs_q:
+            next_q: List[int] = []
+            for rid in bfs_q:
+                process_order.append(rid)
+                sn, en = road_nodes.get(rid, (None, None))
+                if sn is None:
+                    continue
+                for nid in (sn, en):
+                    for nb_rid in junction_roads.get(nid, set()):
+                        if nb_rid in all_fat_road_ids and nb_rid not in visited_tree:
+                            visited_tree.add(nb_rid)
+                            parent_of[nb_rid] = rid
+                            next_q.append(nb_rid)
+            bfs_q = next_q
+
+    # Roads with no junction topology are isolated roots
+    for rid in sorted(all_fat_road_ids):
+        if rid not in visited_tree:
+            parent_of[rid] = None
+            process_order.append(rid)
+
+    # road_overflow[rid] = FAT tuples passed up from child roads
+    road_overflow: Dict[int, List[Tuple[FAT, int]]] = defaultdict(list)
+
+    def _walk_fat_seq(
+        fat_seq: List[Tuple[FAT, int]],
+        prepend: Optional[List[Tuple[FAT, int]]] = None,
+    ) -> Optional[Tuple[List[FAT], int]]:
+        """Walk (fat, road_id) pairs with look-ahead optimal group sizing.
+
+        Instead of greedy MAX-fill (which produces avoidable underfilled tails),
+        we plan group sizes over the full sequence before walking:
+
+          N = total FATs,  q, r = divmod(N, MAX)
+          • r == 0          → q groups of MAX          (exact multiple)
+          • r >= MIN        → q groups of MAX + 1 of r (valid tail)
+          • 0 < r < MIN     → convert 'deficit' groups from MAX to (MAX-1=MIN):
+              deficit = MIN - r
+              If deficit <= q: (q-deficit) × MAX + (deficit+1) × MIN  ← no underfill
+              Else: q × MAX + 1 × r                                    ← unavoidable
+
+        Returns (remainder_fats, primary_road_id) only when the tail group is
+        unavoidably < MIN (i.e. the corridor total cannot be partitioned into
+        all-valid groups), so the caller can pass it to a parent corridor.
+        Returns None when every group emitted is ≥ MIN.
+        """
+        full = (prepend or []) + fat_seq
+        total = len(full)
+        if total == 0:
+            return None
+
+        q, r = divmod(total, MAX_FAT_PER_FDT)
+        if r == 0:
+            sizes = [MAX_FAT_PER_FDT] * q
+        elif r >= MIN_FAT_PER_FDT:
+            sizes = [MAX_FAT_PER_FDT] * q + [r]
+        else:
+            deficit = MIN_FAT_PER_FDT - r
+            if deficit <= q:
+                # Convert 'deficit' full groups to MIN-sized groups; tail becomes MIN
+                sizes = ([MAX_FAT_PER_FDT] * (q - deficit)
+                         + [MIN_FAT_PER_FDT] * (deficit + 1))
+            else:
+                # Cannot partition so all groups ≥ MIN — unavoidable tail
+                sizes = [MAX_FAT_PER_FDT] * q + ([r] if r > 0 else [])
+
+        idx = 0
+        for i, size in enumerate(sizes):
+            chunk = full[idx: idx + size]
+            idx += size
+            if not chunk:
+                continue
+            grp_fats = [fat for fat, _ in chunk]
+            grp_primary = chunk[0][1]
+            is_last = (i == len(sizes) - 1)
+            if not is_last or len(grp_fats) >= MIN_FAT_PER_FDT:
+                result_groups.append((grp_fats, grp_primary))
+            else:
+                # Unavoidable underfilled tail — return for parent-corridor flow
+                return (grp_fats, grp_primary)
+        return None
+
+    # ── 4. Walk spanning tree leaves → root ───────────────────────────────
+    # Reverse BFS order = leaves first, root last.  Each road processes its
+    # own FATs (merged with any dead-end injections) plus overflow received
+    # from child roads, applies look-ahead optimal sizing, emits valid groups,
+    # and passes any unavoidable remainder up to its parent road.
+    for rid in reversed(process_order):
+        own_fats = fats_by_road.get(rid, [])
+        injections = dead_end_inject.get(rid, [])
+
+        if injections:
+            max_co = max((f.cascade_order for f in own_fats), default=0)
+            pos_list_r: List[Tuple[float, bool, FAT]] = []
+            for fat in own_fats:
+                norm = fat.cascade_order / max_co if max_co > 0 else 0.5
+                pos_list_r.append((norm, False, fat))
+            for inj_pos, inj_fats in injections:
+                for fat in inj_fats:
+                    pos_list_r.append((inj_pos, True, fat))
+            pos_list_r.sort(key=lambda x: (x[0], x[1]))
+            own_seq: List[Tuple[FAT, int]] = [(fat, rid) for _, _, fat in pos_list_r]
+        else:
+            own_seq = [(fat, rid) for fat in own_fats]
+
+        prepend_ov = road_overflow.get(rid, [])
+        if not own_seq and not prepend_ov:
+            continue
+
+        remainder = _walk_fat_seq(own_seq, prepend_ov if prepend_ov else None)
+
+        if remainder is not None:
+            rem_fats, rem_primary = remainder
+            parent = parent_of.get(rid)
+            if parent is not None:
+                road_overflow[parent].extend(
+                    (fat, rem_primary) for fat in rem_fats)
+                logger.log(
+                    f"Road {rid}: {len(rem_fats)} remainder FATs "
+                    f"→ parent road {parent}")
+            else:
+                logger.log(
+                    f"Road {rid}: {len(rem_fats)} remainder FATs "
+                    f"(root) — deferred to combination pass")
+                result_groups.append((rem_fats, rem_primary))
+
+    # ── Orphaned dead-end FATs ─────────────────────────────────────────────
+    for nid, fat_list in orphan_pending.items():
+        if not fat_list:
+            continue
+        p_rid = fat_list[0].road_id
+        logger.log(
+            f"Junction {nid}: {len(fat_list)} orphaned dead-end FATs "
+            f"— deferred to combination pass")
+        # Use optimal sizing so orphan groups also minimise underfilled chunks
+        oq, or_ = divmod(len(fat_list), MAX_FAT_PER_FDT)
+        if or_ == 0:
+            o_sizes = [MAX_FAT_PER_FDT] * oq
+        elif or_ >= MIN_FAT_PER_FDT:
+            o_sizes = [MAX_FAT_PER_FDT] * oq + [or_]
+        else:
+            o_def = MIN_FAT_PER_FDT - or_
+            if o_def <= oq:
+                o_sizes = ([MAX_FAT_PER_FDT] * (oq - o_def)
+                           + [MIN_FAT_PER_FDT] * (o_def + 1))
+            else:
+                o_sizes = [MAX_FAT_PER_FDT] * oq + ([or_] if or_ > 0 else [])
+        oidx = 0
+        for o_size in o_sizes:
+            chunk = fat_list[oidx: oidx + o_size]
+            oidx += o_size
+            if chunk:
+                result_groups.append((chunk, p_rid))
+
+    # ── Post-pass: combine underfilled groups via junction topology ────────
+    # BFS-finds connected components of underfilled groups, pools their FATs,
+    # and re-walks at MAX so only a truly isolated terminal group stays small.
+
+    # Index: road_id → result_groups index (first group that owns that road)
+    road_to_group: Dict[int, int] = {}
+    for gi, (gfats, _) in enumerate(result_groups):
+        for fat in gfats:
+            road_to_group.setdefault(fat.road_id, gi)
+
+    def _adj_group_ids(gi: int) -> Set[int]:
+        gfats, prid = result_groups[gi]
+        # Include both individual FAT road_ids AND the group's primary_road_id.
+        # FATs injected from dead-ends keep their original (dead-end) road_id, so
+        # checking only fat.road_id can miss the parent road's junctions entirely.
+        check_rids: Set[int] = {fat.road_id for fat in gfats}
+        if prid is not None:
+            check_rids.add(prid)
+        adj: Set[int] = set()
+        for rid in check_rids:
+            sn, en = road_nodes.get(rid, (None, None))
+            if sn is None:
+                continue
+            for nid in (sn, en):
+                for nb_rid in junction_roads.get(nid, set()):
+                    other_gi = road_to_group.get(nb_rid)
+                    if other_gi is not None and other_gi != gi:
+                        adj.add(other_gi)
+        return adj
+
+    underfilled_gis: Set[int] = {
+        gi for gi, (g, _) in enumerate(result_groups)
+        if g and len(g) < MIN_FAT_PER_FDT
+    }
+
+    visited_gis: Set[int] = set()
+    consumed_gis: Set[int] = set()
+    new_groups: List[Tuple[List[FAT], int]] = []
+
+    for start in sorted(underfilled_gis):
+        if start in visited_gis:
+            continue
+        component: List[int] = []
+        stack = [start]
+        while stack:
+            gi = stack.pop()
+            if gi in visited_gis:
+                continue
+            visited_gis.add(gi)
+            if gi in underfilled_gis:
+                component.append(gi)
+                for adj_gi in _adj_group_ids(gi):
+                    if adj_gi in underfilled_gis and adj_gi not in visited_gis:
+                        stack.append(adj_gi)
+        if not component:
+            continue
+        pool: List[FAT] = []
+        p_rid = result_groups[component[0]][1]
+        for gi in component:
+            pool.extend(result_groups[gi][0])
+            consumed_gis.add(gi)
+        pool.sort(key=_fat_sort_key)
+        # Use same look-ahead optimal sizing as _walk_fat_seq
+        pn = len(pool)
+        pq, pr = divmod(pn, MAX_FAT_PER_FDT)
+        if pr == 0:
+            p_sizes = [MAX_FAT_PER_FDT] * pq
+        elif pr >= MIN_FAT_PER_FDT:
+            p_sizes = [MAX_FAT_PER_FDT] * pq + [pr]
+        else:
+            p_deficit = MIN_FAT_PER_FDT - pr
+            if p_deficit <= pq:
+                p_sizes = ([MAX_FAT_PER_FDT] * (pq - p_deficit)
+                           + [MIN_FAT_PER_FDT] * (p_deficit + 1))
+            else:
+                p_sizes = [MAX_FAT_PER_FDT] * pq + ([pr] if pr > 0 else [])
+        pidx = 0
+        for p_size in p_sizes:
+            chunk = pool[pidx: pidx + p_size]
+            pidx += p_size
+            if chunk:
+                new_groups.append((chunk, p_rid))
+
+    result_groups = (
+        [(g, p) for gi, (g, p) in enumerate(result_groups)
+         if gi not in consumed_gis and g]
+        + new_groups
+    )
+
+    # Log any still-underfilled groups as truly isolated — no combinable neighbour
+    for g, p in result_groups:
+        if g and len(g) < MIN_FAT_PER_FDT:
+            logger.log(
+                f"Road {p}: truly isolated — {len(g)} FATs (min {MIN_FAT_PER_FDT})")
+            error_collector.add_error(
+                "FDT_UNDERFILLED", f"Road {p}",
+                f"Truly isolated: {len(g)} FATs (min {MIN_FAT_PER_FDT})")
+
+    # ── 8. Build FDT objects ───────────────────────────────────────────────
+    fdts: List[FDT] = []
+    for counter, (group_fats, primary_road_id) in enumerate(result_groups, start=1):
+        if not group_fats:
+            continue
+        if len(group_fats) > MAX_FAT_PER_FDT:
+            raise ValidationError(
+                f"Group has {len(group_fats)} FATs, "
+                f"exceeds MAX_FAT_PER_FDT ({MAX_FAT_PER_FDT})")
+        fdt = _make_fdt(group_fats, counter, primary_road_id=primary_road_id, roads=roads)
+        if fdt.total_customers > MAX_FDT_CAPACITY:
+            raise ValidationError(
+                f"{fdt.name} has {fdt.total_customers} customers, "
+                f"exceeds {MAX_FDT_CAPACITY}")
+        fdts.append(fdt)
+        logger.log(
+            f"Road {primary_road_id} -> {fdt.name} "
+            f"({fdt.total_fat} FAT, {fdt.total_customers} customers)")
+
+    # ── Two-way validation ────────────────────────────────────────────────
+    # Confirm FAT count is conserved and actual FDT count sits within the
+    # theoretically valid range:
+    #   min_fdts = floor(total_fats / MAX)  — if every FDT is fully packed
+    #   max_fdts = ceil (total_fats / MIN)  — if every FDT carries MIN FATs
+    total_fat_input = len(fats)
+    total_fat_output = sum(fdt.total_fat for fdt in fdts)
+    if total_fat_input != total_fat_output:
+        error_collector.add_error(
+            "FDT_FAT_MISMATCH", "generate_fdts",
+            f"FAT count mismatch: input {total_fat_input} → output {total_fat_output}")
+        logger.log(
+            f"CRITICAL: FAT count mismatch — input {total_fat_input}, "
+            f"output {total_fat_output}")
+
+    if total_fat_input > 0:
+        min_fdts = total_fat_input // MAX_FAT_PER_FDT or 1
+        max_fdts = -(-total_fat_input // MIN_FAT_PER_FDT)  # ceiling division
+        actual_fdt_count = len(fdts)
+        underfilled_count = sum(1 for fdt in fdts if fdt.total_fat < MIN_FAT_PER_FDT)
+        logger.log(
+            f"Two-way check: {total_fat_input} FATs → valid FDT range "
+            f"[{min_fdts}, {max_fdts}], actual {actual_fdt_count} FDTs, "
+            f"{underfilled_count} underfilled (truly isolated)")
+        if not (min_fdts <= actual_fdt_count <= max_fdts):
+            error_collector.add_error(
+                "FDT_COUNT_OUT_OF_RANGE", "generate_fdts",
+                f"Expected {min_fdts}–{max_fdts} FDTs for {total_fat_input} FATs, "
+                f"got {actual_fdt_count}")
 
     logger.end_module("FDT Generation")
     logger.log(f"Generated {len(fdts)} FDTs")
     return fdts
-def _make_fdt(group_fats: List[FAT], counter: int) -> FDT:
+def _make_fdt(group_fats: List[FAT], counter: int,
+              primary_road_id: Optional[int] = None,
+              roads: Optional[Dict] = None) -> FDT:
     """Create a single FDT object from a FAT group.
 
     Ensures downstream modules always receive:
@@ -1966,10 +3308,26 @@ def _make_fdt(group_fats: List[FAT], counter: int) -> FDT:
     if not group_fats:
         raise ValidationError("Cannot create FDT from an empty FAT group")
 
-    # FDT point: centroid of member FAT points (deterministic, no randomness)
-    cx = sum(f.geometry.x() for f in group_fats) / len(group_fats)
-    cy = sum(f.geometry.y() for f in group_fats) / len(group_fats)
-    fdt_point = QgsPointXY(cx, cy)
+    # FDT point: centroid of PRIMARY-road FATs only, then snapped to that road.
+    # Using all FATs (including borrowed cross-road neighbours) biases the
+    # centroid toward side streets and produces a wrong snap position even
+    # after nearestPoint — the projected point ends up at the wrong end of
+    # the primary road.
+    _primary_anchor = ([f for f in group_fats if f.road_id == primary_road_id]
+                       if primary_road_id is not None else [])
+    anchor_fats = _primary_anchor if _primary_anchor else group_fats
+
+    cx = sum(f.geometry.x() for f in anchor_fats) / len(anchor_fats)
+    cy = sum(f.geometry.y() for f in anchor_fats) / len(anchor_fats)
+    centroid = QgsPointXY(cx, cy)
+    fdt_point = centroid  # default — overwritten below if road snap succeeds
+
+    if primary_road_id is not None and roads:
+        road = roads.get(primary_road_id)
+        if road and road.geometry and not road.geometry.isEmpty():
+            snapped = road.geometry.nearestPoint(QgsGeometry.fromPointXY(centroid))
+            if snapped and not snapped.isEmpty():
+                fdt_point = snapped.asPoint()
 
     total_customers = sum(f.total_customers for f in group_fats)
     # Wing assignment is applied later per FDT by assign_wings_per_fdt.
@@ -1997,7 +3355,8 @@ def _make_fdt(group_fats: List[FAT], counter: int) -> FDT:
         fdt_code=fdt_code,
         fdt_serial=fdt_serial,
         fats=list(group_fats),
-        zone_geometry=zone_geom
+        zone_geometry=zone_geom,
+        primary_road_id=primary_road_id,
     )
 
 # =============================================================================
@@ -2214,13 +3573,15 @@ class CableRouter:
 
     def __init__(self, road_layer: QgsVectorLayer, dist_calc: DistanceCalculator,
                  roads: Optional[Dict[int, 'RoadSegment']] = None,
-                 road_index: Optional[QgsSpatialIndex] = None):
-        self.road_layer = road_layer
-        self.dist_calc = dist_calc
-        self.roads = roads or {}
-        self.road_index = road_index
-        self.graph_builder = None
-        self.graph = None
+                 road_index: Optional[QgsSpatialIndex] = None,
+                 topology_engine: Optional['RoadTopologyEngine'] = None):
+        self.road_layer      = road_layer
+        self.dist_calc       = dist_calc
+        self.roads           = roads or {}
+        self.road_index      = road_index
+        self.topology_engine = topology_engine   # weighted graph for routing
+        self.graph_builder   = None
+        self.graph           = None
         self._vertex_index: Optional[QgsSpatialIndex] = None
         
     def build_graph(self):
@@ -2277,97 +3638,91 @@ class CableRouter:
                            end_road_id: Optional[int] = None) -> Tuple[QgsGeometry, float]:
         """Find shortest path along road network between two device points.
 
-        The path is built as:
-            start_device → start_road_snap → [Dijkstra graph path] → end_road_snap → end_device
+        Routing strategy (priority order):
+          1. Topology-engine weighted Dijkstra (preferred) — uses road-class
+             weights, turn-penalty, and virtual connectors for OSM gap healing.
+             Returns empty geometry on routing failure (never straight-line).
+          2. Legacy QGIS-graph Dijkstra (fallback when no topology engine).
+             Also returns empty geometry on failure instead of a straight line.
 
-        This guarantees:
-        - Graph lookup uses the road-projected point (correct road, no cross-street snap)
-        - The final cable geometry includes the short frontage stubs so
-          ``_enforce_exact_cable_endpoints`` never needs to add a straight-line
-          shortcut that crosses buildings.
+        Callers must check `geom.isEmpty()` and log ROUTING_FAILURE accordingly.
         """
+        def _fail() -> Tuple[QgsGeometry, float]:
+            return QgsGeometry(), 0.0
+
+        # ── Path 1: topology-engine weighted Dijkstra ────────────────────
+        if self.topology_engine is not None and self.topology_engine.adj:
+            return self.topology_engine.weighted_shortest_path(
+                start, end,
+                start_road_id=start_road_id,
+                end_road_id=end_road_id,
+            )
+
+        # ── Path 2: legacy QGIS-graph Dijkstra ──────────────────────────
         if not self.graph:
             self.build_graph()
 
-        # Step 1: project device points onto their own roads.
         start_road_pt = self._road_snap(start, start_road_id)
         end_road_pt   = self._road_snap(end,   end_road_id)
-
-        # Step 2: find nearest graph vertices to the *road* projections.
-        start_vertex = self.find_nearest_vertex(start_road_pt)
-        end_vertex   = self.find_nearest_vertex(end_road_pt)
-
-        # Helper: build straight-line fallback
-        def _straight(a: QgsPointXY, b: QgsPointXY) -> Tuple[QgsGeometry, float]:
-            g = QgsGeometry.fromPolylineXY([a, b])
-            return g, self.dist_calc.distance_points(a, b)
+        start_vertex  = self.find_nearest_vertex(start_road_pt)
+        end_vertex    = self.find_nearest_vertex(end_road_pt)
 
         if start_vertex < 0 or end_vertex < 0:
-            return _straight(start, end)
+            return _fail()
 
         if start_vertex == end_vertex:
-            # Both snap to same vertex: build stub-only path
             pts = _dedupe_points([start, start_road_pt, end_road_pt, end])
             if len(pts) < 2:
-                return _straight(start, end)
+                return _fail()
             return QgsGeometry.fromPolylineXY(pts), sum(
-                self.dist_calc.distance_points(pts[i], pts[i+1])
-                for i in range(len(pts)-1)
+                self.dist_calc.distance_points(pts[i], pts[i + 1])
+                for i in range(len(pts) - 1)
             )
 
-        # Step 3: Dijkstra on graph
-        tree, cost = QgsGraphAnalyzer.dijkstra(self.graph, start_vertex, 0)
+        tree, _ = QgsGraphAnalyzer.dijkstra(self.graph, start_vertex, 0)
 
         if end_vertex >= len(tree) or tree[end_vertex] == -1:
-            return _straight(start, end)
+            return _fail()   # disconnected graph — no straight-line fallback
 
-        # Step 4: reconstruct vertex list from graph
         vertex_count = self.graph.vertexCount()
         edge_count   = self.graph.edgeCount()
         if end_vertex < 0 or end_vertex >= vertex_count:
-            return _straight(start, end)
+            return _fail()
 
         try:
             graph_pts = [self.graph.vertex(end_vertex).point()]
         except Exception:
-            return _straight(start, end)
+            return _fail()
 
         current   = end_vertex
         max_steps = vertex_count + edge_count + 10
         steps     = 0
         while current != start_vertex:
             if current < 0 or current >= len(tree):
-                return _straight(start, end)
+                return _fail()
             edge_id = tree[current]
             if edge_id < 0 or edge_id >= edge_count:
-                return _straight(start, end)
+                return _fail()
             edge    = self.graph.edge(edge_id)
             current = edge.fromVertex()
             if current < 0 or current >= vertex_count:
-                return _straight(start, end)
+                return _fail()
             try:
                 graph_pts.append(self.graph.vertex(current).point())
             except Exception:
-                return _straight(start, end)
+                return _fail()
             steps += 1
             if steps > max_steps:
-                return _straight(start, end)
+                return _fail()
 
         graph_pts.reverse()
-
-        # Step 5: stitch full path:
-        #   device_start → road_snap_start → graph_pts → road_snap_end → device_end
-        # _dedupe_points removes consecutive duplicates so we don't get
-        # zero-length segments when the device is already on the road.
         full_path = _dedupe_points(
             [start, start_road_pt] + graph_pts + [end_road_pt, end]
         )
         if len(full_path) < 2:
-            return _straight(start, end)
-
-        geom   = QgsGeometry.fromPolylineXY(full_path)
-        length = geom.length()
-        return geom, length
+            return _fail()
+        geom = QgsGeometry.fromPolylineXY(full_path)
+        return geom, geom.length()
     
     def find_nearest_vertex(self, point: QgsPointXY) -> int:
         """Find nearest vertex index in graph. Uses spatial index when available."""
@@ -2473,9 +3828,10 @@ def route_fdt_to_fats(fdts: List[FDT],
         fdt_point = fdt.snapped_geometry or fdt.geometry
         fdt_geom  = QgsGeometry.fromPointXY(fdt_point)
 
-        # Determine the FDT's road_id as the most common road_id among its FATs
-        fdt_road_id: Optional[int] = None
-        if fdt.fats:
+        # Prefer primary_road_id (the spanning-tree road this FDT was anchored to);
+        # fall back to majority-vote over FAT road_ids only when unset.
+        fdt_road_id: Optional[int] = fdt.primary_road_id
+        if fdt_road_id is None and fdt.fats:
             from collections import Counter
             fdt_road_id = Counter(f.road_id for f in fdt.fats).most_common(1)[0][0]
 
@@ -2513,15 +3869,44 @@ def route_fdt_to_fats(fdts: List[FDT],
                         f"FAT {fat.name} is outside FDT zone"
                     )
 
-                # Find road-following shortest path
-                # road_ids are passed so each endpoint is first projected onto
-                # its own road before graph-vertex lookup, preventing cross-road snapping.
+                # Find road-following shortest path (never returns a straight line).
+                # road_ids anchor each endpoint to its correct road so graph-vertex
+                # lookup cannot snap across to a different road's nearby vertex.
                 geom, length = cable_router.find_shortest_path(
                     start_point, end_point,
                     start_road_id=start_road_id,
                     end_road_id=end_road_id
                 )
+
+                # Routing failure: empty geometry means no valid topology path exists.
+                # Log and skip — do NOT create a cable that crosses obstacles.
+                if geom is None or geom.isEmpty():
+                    error_collector.add_error(
+                        "ROUTING_FAILURE",
+                        f"{source_name}→{fat.name}",
+                        f"No topology path found between {source_name} "
+                        f"(road {start_road_id}) and {fat.name} "
+                        f"(road {end_road_id}). Cable NOT created."
+                    )
+                    continue
+
                 length = geom.length()
+
+                # Enforce exact cable endpoints so exported geometry touches
+                # the device points precisely (prevents floating-point gap errors).
+                try:
+                    geom = _enforce_exact_cable_endpoints(
+                        geom,
+                        QgsGeometry.fromPointXY(start_point),
+                        QgsGeometry.fromPointXY(end_point),
+                    )
+                except ValidationError as ep_err:
+                    error_collector.add_error(
+                        "CABLE_ENDPOINT_ERROR",
+                        f"{source_name}→{fat.name}",
+                        str(ep_err)
+                    )
+                    # Continue with original geometry rather than dropping the cable
 
                 # Validate length
                 if length > MAX_BOX_TO_BOX_DISTANCE:
@@ -4106,7 +5491,7 @@ def run_fttx_design(config: Optional[FTTXConfig] = None,
 
         # Process roads
         _update_progress(10, "Road Processing")
-        roads = process_roads(layers['road'], index_mgr, logger)
+        roads, topo = process_roads(layers['road'], index_mgr, logger, dist_calc=dist_calc)
 
         # Assign homepasses to roads
         _update_progress(25, "Homepass Assignment")
@@ -4133,15 +5518,14 @@ def run_fttx_design(config: Optional[FTTXConfig] = None,
 
         # Generate FDTs
         _update_progress(65, "FDT Generation")
-        _fdt_road_index = index_mgr.get_index(layers['road'])
         fdts = generate_fdts(
             fats, error_collector, logger,
-            roads=roads, road_index=_fdt_road_index, dist_calc=dist_calc
+            roads=roads, dist_calc=dist_calc, topo=topo
         )
 
         # Assign wings per FDT
         _update_progress(75, "Wing Assignment")
-        assign_wings_per_fdt(fdts, logger)
+        assign_wings_per_fdt(fdts, logger, roads=roads, dist_calc=dist_calc)
         create_fdt_wing_cascades(fdts, error_collector, logger)
 
         # Snap to poles
@@ -4153,7 +5537,8 @@ def run_fttx_design(config: Optional[FTTXConfig] = None,
         # Cable routing
         _update_progress(95, "Cable Routing")
         road_index = index_mgr.get_index(layers['road'])
-        cable_router = CableRouter(layers['road'], dist_calc, roads=roads, road_index=road_index)
+        cable_router = CableRouter(layers['road'], dist_calc, roads=roads,
+                                   road_index=road_index, topology_engine=topo)
         cable_router.build_graph()
 
         b2b_cables = route_fdt_to_fats(fdts, cable_router, error_collector, logger)
