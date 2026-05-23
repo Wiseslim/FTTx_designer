@@ -771,42 +771,50 @@ def _generate_pickup_points(closures: List[DomeClosure],
                             road_index: QgsSpatialIndex,
                             dist_calc: DistanceCalculator,
                             logger: PerformanceLogger) -> List[QgsPointXY]:
-    """Automatically generate one or more pickup points for the closures.
+    """Automatically generate one pickup point per closure group.
 
-    - Closures are clustered spatially using a simple greedy algorithm;
-    - Each cluster yields a centroid which is then snapped to the nearest road
-      to ensure a road-accessible pickup location.
-    - The resulting points are assigned back to each closure's ``pickup_geometry``
-      (and ``pickup_name``) so that feeder routing can use them.
+    Each pickup is placed at the road point nearest to the centroid of its
+    closure group.  Uses nearestPoint() (same method as all other road-snapping
+    in the script) so the result is always a valid road-geometry point that
+    Dijkstra can reach without falling back to a straight line.
     """
     if not closures:
         return []
-    # decide number of clusters based on desired closures per pickup
+
     num_clusters = max(1, math.ceil(len(closures) / CLOSURES_PER_PICKUP))
-    clusters = _cluster_closures(closures, math.ceil(len(closures) / num_clusters), dist_calc)
+    clusters     = _cluster_closures(
+        closures, math.ceil(len(closures) / num_clusters), dist_calc
+    )
 
     generated: List[QgsPointXY] = []
     for ci, cluster in enumerate(clusters, start=1):
         if not cluster:
             continue
-        # compute centroid of cluster
-        cx = sum(c.geometry.x() for c in cluster) / len(cluster)
-        cy = sum(c.geometry.y() for c in cluster) / len(cluster)
+
+        # Centroid of this closure group
+        cx       = sum(c.geometry.x() for c in cluster) / len(cluster)
+        cy       = sum(c.geometry.y() for c in cluster) / len(cluster)
         centroid = QgsPointXY(cx, cy)
-        # snap centroid to nearest road if possible
+
+        # Snap to nearest road using nearestPoint() — consistent with rest of script
+        pickup_pt = centroid
         if road_index:
             nearest = road_index.nearestNeighbor(centroid, 1)
             if nearest:
                 road = roads.get(nearest[0])
                 if road and road.geometry and not road.geometry.isEmpty():
-                    # closestSegmentWithContext now returns four values (distance, point, vertex_index, left_of)
-                    _d, snap_pt, _idx, _left = road.geometry.closestSegmentWithContext(centroid)
-                    centroid = QgsPointXY(snap_pt.x(), snap_pt.y())
+                    snapped = road.geometry.nearestPoint(
+                        QgsGeometry.fromPointXY(centroid)
+                    )
+                    if snapped and not snapped.isEmpty():
+                        pickup_pt = snapped.asPoint()
+
         pickup_name = f"PICKUP_{ci}"
-        generated.append(centroid)
+        generated.append(pickup_pt)
         for c in cluster:
-            c.pickup_geometry = centroid
-            c.pickup_name = pickup_name
+            c.pickup_geometry = pickup_pt
+            c.pickup_name     = pickup_name
+
     logger.log(f"Generated {len(generated)} automatic pickup point(s)")
     return generated
 
@@ -2930,6 +2938,10 @@ def generate_fdts(fats: List[FAT],
 
     # dead_end_inject[parent_rid] = [(position_0_1, fat_list), ...]
     dead_end_inject: Dict[int, List[Tuple[float, List[FAT]]]] = defaultdict(list)
+    # overflow_inject[parent_rid] = [(position_0_1, fat_list), ...]
+    # Like dead_end_inject but for non-dead-end child overflow — FATs are merged
+    # at the junction position on the parent road rather than blindly prepended.
+    overflow_inject: Dict[int, List[Tuple[float, List[FAT]]]] = defaultdict(list)
     # orphan_pending[nid] = FATs with no identifiable parent
     orphan_pending: Dict[int, List[FAT]] = defaultdict(list)
     # result_groups is built up throughout; finalised in step 8
@@ -3002,6 +3014,15 @@ def generate_fdts(fats: List[FAT],
                 for nid in (sn, en):
                     for nb_rid in junction_roads.get(nid, set()):
                         if nb_rid in all_fat_road_ids and nb_rid not in visited_tree:
+                            # ENHANCEMENT: never cross the dual-carriageway median in
+                            # the spanning tree.  Partner carriageways share junction
+                            # nodes by topology but must serve their own FATs
+                            # independently — linking them here causes overflow FATs
+                            # to be routed across the median and FATs from both sides
+                            # to land in the same FDT group.
+                            _nb_rd = roads.get(nb_rid) if roads else None
+                            if _nb_rd and _nb_rd.dual_cw_partner == rid:
+                                continue
                             visited_tree.add(nb_rid)
                             parent_of[nb_rid] = rid
                             next_q.append(nb_rid)
@@ -3083,13 +3104,23 @@ def generate_fdts(fats: List[FAT],
         own_fats = fats_by_road.get(rid, [])
         injections = dead_end_inject.get(rid, [])
 
-        if injections:
+        # ENHANCEMENT: overflow from child roads is merged at the geographic junction
+        # position rather than blindly prepended.  This prevents overflow FATs from
+        # a child road that connects near the END of the parent road from appearing
+        # inside the FIRST FDT group (start of parent road), which is the root cause
+        # of boundary invasion between adjacent FDT groups.
+        ov_injections = overflow_inject.get(rid, [])
+        all_injections = injections + ov_injections
+
+        if all_injections:
             max_co = max((f.cascade_order for f in own_fats), default=0)
+            # Avoid division by zero when own_fats is empty (pure overflow road)
+            _norm_denom = max_co if max_co > 0 else 1000
             pos_list_r: List[Tuple[float, bool, FAT]] = []
             for fat in own_fats:
-                norm = fat.cascade_order / max_co if max_co > 0 else 0.5
+                norm = fat.cascade_order / _norm_denom
                 pos_list_r.append((norm, False, fat))
-            for inj_pos, inj_fats in injections:
+            for inj_pos, inj_fats in all_injections:
                 for fat in inj_fats:
                     pos_list_r.append((inj_pos, True, fat))
             pos_list_r.sort(key=lambda x: (x[0], x[1]))
@@ -3107,8 +3138,29 @@ def generate_fdts(fats: List[FAT],
             rem_fats, rem_primary = remainder
             parent = parent_of.get(rid)
             if parent is not None:
-                road_overflow[parent].extend(
-                    (fat, rem_primary) for fat in rem_fats)
+                # ENHANCEMENT: route overflow into overflow_inject (position-aware)
+                # when the junction shared between rid and parent is discoverable.
+                # Falls back to road_overflow (blind prepend) when topology is absent.
+                _routed_via_pos = False
+                if roads and topo and topo._nodes:
+                    _sn_c, _en_c = road_nodes.get(rid, (None, None))
+                    _sn_p, _en_p = road_nodes.get(parent, (None, None))
+                    if _sn_c is not None and _sn_p is not None:
+                        _shared = None
+                        if _sn_c in (_sn_p, _en_p):
+                            _shared = _sn_c
+                        elif _en_c in (_sn_p, _en_p):
+                            _shared = _en_c
+                        if _shared is not None and _shared in topo._nodes:
+                            _jpt = topo._nodes[_shared]['point']
+                            _prd = roads.get(parent)
+                            if _prd and not _prd.geometry.isEmpty():
+                                _pos = _junction_pos(_jpt, _prd)
+                                overflow_inject[parent].append((_pos, rem_fats))
+                                _routed_via_pos = True
+                if not _routed_via_pos:
+                    road_overflow[parent].extend(
+                        (fat, rem_primary) for fat in rem_fats)
                 logger.log(
                     f"Road {rid}: {len(rem_fats)} remainder FATs "
                     f"→ parent road {parent}")
@@ -3173,6 +3225,12 @@ def generate_fdts(fats: List[FAT],
                 for nb_rid in junction_roads.get(nid, set()):
                     other_gi = road_to_group.get(nb_rid)
                     if other_gi is not None and other_gi != gi:
+                        # ENHANCEMENT: never combine groups across the dual-carriageway
+                        # median.  The neighbour road is across the median when its
+                        # dual_cw_partner is one of the roads in the current group.
+                        _nb_r = roads.get(nb_rid) if roads else None
+                        if _nb_r and _nb_r.dual_cw_partner in check_rids:
+                            continue
                         adj.add(other_gi)
         return adj
 
@@ -3180,6 +3238,33 @@ def generate_fdts(fats: List[FAT],
         gi for gi, (g, _) in enumerate(result_groups)
         if g and len(g) < MIN_FAT_PER_FDT
     }
+
+    # ENHANCEMENT: geographic centroid of each group — used to prevent the BFS
+    # from merging underfilled groups that are topologically adjacent but
+    # geographically far apart.  Without this guard, two underfilled groups on
+    # roads that happen to share a distant junction are merged, then re-split in
+    # a way that interleaves FATs from geographically separate areas (boundary
+    # invasion).  We allow merging only when the group centroids are within
+    # MAX_BOX_TO_BOX_DISTANCE of each other.
+    def _group_centroid(gi: int) -> Tuple[float, float]:
+        fats = result_groups[gi][0]
+        if not fats:
+            return (0.0, 0.0)
+        return (sum(f.geometry.x() for f in fats) / len(fats),
+                sum(f.geometry.y() for f in fats) / len(fats))
+
+    def _dual_cw_linked(gi1: int, gi2: int) -> bool:
+        """True when any road in gi1 is the dual-carriageway partner of any road in gi2."""
+        if not roads:
+            return False
+        rids2 = {fat.road_id for fat in result_groups[gi2][0]}
+        for fat in result_groups[gi1][0]:
+            r = roads.get(fat.road_id)
+            if r and r.dual_cw_partner in rids2:
+                return True
+        return False
+
+    _MAX_COMBINE_DIST_SQ = MAX_BOX_TO_BOX_DISTANCE * MAX_BOX_TO_BOX_DISTANCE
 
     visited_gis: Set[int] = set()
     consumed_gis: Set[int] = set()
@@ -3197,9 +3282,14 @@ def generate_fdts(fats: List[FAT],
             visited_gis.add(gi)
             if gi in underfilled_gis:
                 component.append(gi)
+                _c_gi = _group_centroid(gi)
                 for adj_gi in _adj_group_ids(gi):
                     if adj_gi in underfilled_gis and adj_gi not in visited_gis:
-                        stack.append(adj_gi)
+                        _c_adj = _group_centroid(adj_gi)
+                        _dx = _c_gi[0] - _c_adj[0]
+                        _dy = _c_gi[1] - _c_adj[1]
+                        if _dx * _dx + _dy * _dy <= _MAX_COMBINE_DIST_SQ:
+                            stack.append(adj_gi)
         if not component:
             continue
         pool: List[FAT] = []
@@ -3207,7 +3297,12 @@ def generate_fdts(fats: List[FAT],
         for gi in component:
             pool.extend(result_groups[gi][0])
             consumed_gis.add(gi)
-        pool.sort(key=_fat_sort_key)
+        # ENHANCEMENT: sort by (road_id, cascade_order) so FATs from the same
+        # road stay together.  The original _fat_sort_key sorts by cascade_order
+        # first — since cascade_order is road-local (not global), FATs from two
+        # different roads with numerically similar cascade_orders would interleave,
+        # creating groups that span geographically separate locations.
+        pool.sort(key=lambda f: (f.road_id, f.cascade_order))
         # Use same look-ahead optimal sizing as _walk_fat_seq
         pn = len(pool)
         pq, pr = divmod(pn, MAX_FAT_PER_FDT)
@@ -3234,6 +3329,99 @@ def generate_fdts(fats: List[FAT],
          if gi not in consumed_gis and g]
         + new_groups
     )
+
+    # ── Second combination pass: pure geographic proximity (topology-independent) ─
+    # The first BFS pass only merges groups that are topologically connected via
+    # road junctions.  When groups sit on roads with OSM topology gaps, isolated
+    # road segments, or roads not present in the topology graph, they survive the
+    # first pass as separate underfilled groups even though they are physically
+    # within box-to-box cable distance of each other.
+    #
+    # This pass uses a pure DFS over centroid-to-centroid distance
+    # (≤ MAX_BOX_TO_BOX_DISTANCE) — no topology required.  It recalibrates the
+    # group count so that the result is as close to MIN_FAT_PER_FDT as possible,
+    # consistent with the maximum cable-reach constraint that determines which FATs
+    # a single FDT can realistically serve.
+    _still_underfilled: List[int] = [
+        gi for gi, (g, _) in enumerate(result_groups)
+        if g and len(g) < MIN_FAT_PER_FDT
+    ]
+
+    if _still_underfilled:
+        _geo_visited: Set[int] = set()
+        _geo_consumed: Set[int] = set()
+        _geo_new_groups: List[Tuple[List[FAT], int]] = []
+
+        for _start_gi in _still_underfilled:
+            if _start_gi in _geo_visited:
+                continue
+
+            # DFS over geographic proximity — chain groups within cable reach.
+            _geo_comp: List[int] = []
+            _geo_stack: List[int] = [_start_gi]
+            while _geo_stack:
+                _gi = _geo_stack.pop()
+                if _gi in _geo_visited:
+                    continue
+                _geo_visited.add(_gi)
+                _geo_comp.append(_gi)
+                _cx, _cy = _group_centroid(_gi)
+                for _other_gi in _still_underfilled:
+                    if _other_gi in _geo_visited:
+                        continue
+                    # ENHANCEMENT: never combine groups across the dual-carriageway
+                    # median — even if they are within cable-reach distance.
+                    if _dual_cw_linked(_gi, _other_gi):
+                        continue
+                    _ox, _oy = _group_centroid(_other_gi)
+                    _ddx = _cx - _ox
+                    _ddy = _cy - _oy
+                    if _ddx * _ddx + _ddy * _ddy <= _MAX_COMBINE_DIST_SQ:
+                        _geo_stack.append(_other_gi)
+
+            if len(_geo_comp) <= 1:
+                continue  # single isolated group — nothing to combine with
+
+            _geo_pool: List[FAT] = []
+            _geo_p_rid = result_groups[_geo_comp[0]][1]
+            for _gi2 in _geo_comp:
+                _geo_pool.extend(result_groups[_gi2][0])
+                _geo_consumed.add(_gi2)
+
+            _geo_pool.sort(key=lambda f: (f.road_id, f.cascade_order))
+
+            # Apply same look-ahead optimal sizing as _walk_fat_seq
+            _gn = len(_geo_pool)
+            _gq, _gr = divmod(_gn, MAX_FAT_PER_FDT)
+            if _gr == 0:
+                _g_sizes = [MAX_FAT_PER_FDT] * _gq
+            elif _gr >= MIN_FAT_PER_FDT:
+                _g_sizes = [MAX_FAT_PER_FDT] * _gq + [_gr]
+            else:
+                _g_deficit = MIN_FAT_PER_FDT - _gr
+                if _g_deficit <= _gq:
+                    _g_sizes = ([MAX_FAT_PER_FDT] * (_gq - _g_deficit)
+                                + [MIN_FAT_PER_FDT] * (_g_deficit + 1))
+                else:
+                    _g_sizes = [MAX_FAT_PER_FDT] * _gq + ([_gr] if _gr > 0 else [])
+
+            _gidx = 0
+            for _g_size in _g_sizes:
+                _chunk = _geo_pool[_gidx: _gidx + _g_size]
+                _gidx += _g_size
+                if _chunk:
+                    _geo_new_groups.append((_chunk, _geo_p_rid))
+
+            logger.log(
+                f"Geographic recalibration: merged {len(_geo_comp)} underfilled groups "
+                f"({_gn} FATs) → {len(_g_sizes)} group(s)")
+
+        if _geo_consumed:
+            result_groups = (
+                [(g, p) for gi, (g, p) in enumerate(result_groups)
+                 if gi not in _geo_consumed and g]
+                + _geo_new_groups
+            )
 
     # Log any still-underfilled groups as truly isolated — no combinable neighbour
     for g, p in result_groups:
@@ -3632,6 +3820,87 @@ class CableRouter:
             return snapped.asPoint()
         return device_point
 
+    def find_shortest_path_points(self,
+                                   start: QgsPointXY,
+                                   end: QgsPointXY) -> Tuple[QgsGeometry, float]:
+        """Find the true shortest road path between two arbitrary points.
+
+        Uses the QGIS-recommended approach: build a temporary graph with the
+        two points inserted as additional vertices via makeGraph(builder, [p1,p2]).
+        This guarantees both endpoints become exact graph nodes so Dijkstra
+        always finds the globally shortest path — no nearest-vertex rounding
+        error, no long detours.
+
+        Falls back to find_shortest_path (vertex-nearest approach) if the
+        temporary graph build fails.
+        """
+        try:
+            director = QgsVectorLayerDirector(
+                self.road_layer, -1, '', '', '',
+                QgsVectorLayerDirector.DirectionBoth
+            )
+            director.addStrategy(QgsNetworkDistanceStrategy())
+            builder  = QgsGraphBuilder(self.road_layer.crs())
+            # Insert both endpoints as tied points so they become graph vertices
+            tied_pts = director.makeGraph(builder, [start, end])
+            graph    = builder.graph()
+
+            if not tied_pts or len(tied_pts) < 2:
+                return self.find_shortest_path(start, end)
+
+            tied_start = tied_pts[0]
+            tied_end   = tied_pts[1]
+
+            start_v = graph.findVertex(tied_start)
+            end_v   = graph.findVertex(tied_end)
+
+            if start_v < 0 or end_v < 0:
+                return self.find_shortest_path(start, end)
+
+            if start_v == end_v:
+                g = QgsGeometry.fromPolylineXY([tied_start, tied_end])
+                return g, self.dist_calc.distance_points(tied_start, tied_end)
+
+            tree, cost = QgsGraphAnalyzer.dijkstra(graph, start_v, 0)
+
+            if end_v >= len(tree) or tree[end_v] == -1:
+                return self.find_shortest_path(start, end)
+
+            # Reconstruct path
+            pts     = []
+            current = end_v
+            v_count = graph.vertexCount()
+            e_count = graph.edgeCount()
+            steps   = 0
+            max_s   = v_count + e_count + 10
+
+            while current != start_v:
+                if current < 0 or current >= v_count:
+                    return self.find_shortest_path(start, end)
+                pts.append(graph.vertex(current).point())
+                eid = tree[current]
+                if eid < 0 or eid >= e_count:
+                    return self.find_shortest_path(start, end)
+                current = graph.edge(eid).fromVertex()
+                steps  += 1
+                if steps > max_s:
+                    return self.find_shortest_path(start, end)
+
+            pts.append(graph.vertex(start_v).point())
+            pts.reverse()
+
+            pts = _dedupe_points(pts)
+            if len(pts) < 2:
+                return self.find_shortest_path(start, end)
+
+            geom   = QgsGeometry.fromPolylineXY(pts)
+            length = geom.length()
+            return geom, length
+
+        except Exception:
+            # Any failure: fall back to the standard vertex-nearest approach
+            return self.find_shortest_path(start, end)
+
     def find_shortest_path(self, start: QgsPointXY, end: QgsPointXY,
                            constraints: Optional[Dict] = None,
                            start_road_id: Optional[int] = None,
@@ -3869,16 +4138,16 @@ def route_fdt_to_fats(fdts: List[FDT],
                         f"FAT {fat.name} is outside FDT zone"
                     )
 
-                # Find road-following shortest path (never returns a straight line).
-                # road_ids anchor each endpoint to its correct road so graph-vertex
-                # lookup cannot snap across to a different road's nearby vertex.
-                geom, length = cable_router.find_shortest_path(
-                    start_point, end_point,
-                    start_road_id=start_road_id,
-                    end_road_id=end_road_id
+                # Use find_shortest_path_points: inserts both endpoints as exact
+                # tied vertices via makeGraph so Dijkstra enters/exits roads at
+                # the precise snapped positions rather than the nearest junction.
+                # This eliminates the fan/star artefact caused by multiple FATs
+                # anchoring to the same junction node via road_id lookup.
+                geom, length = cable_router.find_shortest_path_points(
+                    start_point, end_point
                 )
 
-                # Routing failure: empty geometry means no valid topology path exists.
+                # Routing failure: empty geometry means no valid path exists.
                 # Log and skip — do NOT create a cable that crosses obstacles.
                 if geom is None or geom.isEmpty():
                     error_collector.add_error(
@@ -4438,52 +4707,44 @@ def correct_cable_zone_violations(closures: List[DomeClosure],
 def route_closure_to_fdts(closures: List[DomeClosure],
                           cable_router: CableRouter,
                           logger: PerformanceLogger) -> List[CableSegment]:
-    """Route Closure→FDT distribution cables via direct Dijkstra shortest path.
+    """Route Closure→FDT distribution cables — one road-following cable per FDT.
 
-    Design principle (matches reference image exactly)
-    ──────────────────────────────────────────────────
-    Each FDT in a closure's cluster receives ONE direct cable routed along the
-    road network from the closure point to the FDT point.  The "tree" that
-    appears in the reference image is simply the visual result of multiple
-    Dijkstra paths sharing common road segments — there is NO explicit cascade
-    chaining between FDTs.  This is identical to how FAT→FAT box-to-box cables
-    work, applied at the closure→FDT level.
+    Strategy: shared-graph Dijkstra per closure
+    ────────────────────────────────────────────
+    For each closure, build ONE temporary QGIS graph that inserts the closure
+    point AND every FDT point as exact tied vertices via makeGraph().  Then run
+    Dijkstra ONCE from the closure vertex so a single O(V log V) pass gives the
+    shortest-path tree to ALL FDT vertices simultaneously.  Each FDT path is
+    reconstructed by tracing back through that tree.
 
-    Key rules enforced here:
-      1. Zone integrity  – only FDTs that belong to this closure are routed.
-         FDT membership was already enforced by enforce_closure_zone_membership
-         in generate_closures(), so closure.fdts is already clean.
-      2. Correct road anchoring – both endpoints are road-snapped via their
-         own road_id so Dijkstra never routes through the wrong street.
-      3. FDTs sorted by distance from closure for deterministic core assignment.
-      4. Core pairs (active + redundant) assigned sequentially; cascade groups
-         of MAX_FDT_PER_8CORE (4) per 8-core sub-cable.
+    Why this eliminates the flying-cable artefact
+    ─────────────────────────────────────────────
+    The previous approach used weighted_shortest_path() which anchors each
+    endpoint to the nearest road JUNCTION node.  For mid-road devices the path
+    included a straight stub from the snap point to the junction — cutting
+    directly through buildings.  makeGraph() inserts the exact device coordinates
+    as graph vertices on the road centre-line, so every segment in the output
+    geometry follows actual road geometry with no off-road stubs.
+
+    Fallback: if the shared graph build fails for a closure, each FDT is routed
+    individually via find_shortest_path_points() which also uses makeGraph but
+    with just two tied points.
+
+    Rules preserved:
+      1. Zone integrity  – closure.fdts is already clean from generate_closures().
+      2. FDTs sorted by distance for deterministic core assignment.
+      3. Core pairs assigned sequentially in groups of MAX_FDT_PER_8CORE.
     """
     logger.start_module("Closure to FDT Routing")
     cables: List[CableSegment] = []
-
-    road_index = cable_router.road_index
 
     for closure in closures:
         if not closure.fdts:
             continue
 
-        # ── Closure point and its road anchor ────────────────────────────────
         closure_pt = closure.snapped_geometry or closure.geometry
-        closure_road_id: Optional[int] = None
-        if road_index:
-            ids = road_index.nearestNeighbor(closure_pt, 1)
-            if ids:
-                closure_road_id = ids[0]
 
-        # ── FDT primary road helper ───────────────────────────────────────────
-        def _fdt_road(fdt: FDT) -> Optional[int]:
-            if fdt.fats:
-                from collections import Counter
-                return Counter(f.road_id for f in fdt.fats).most_common(1)[0][0]
-            return None
-
-        # ── Sort FDTs by distance from closure (deterministic core order) ─────
+        # ── Sort FDTs by distance for deterministic core assignment ───────────
         sorted_fdts = sorted(
             closure.fdts,
             key=lambda f: (
@@ -4503,10 +4764,43 @@ def route_closure_to_fdts(closures: List[DomeClosure],
                 f"{max_fdt_for_capacity}; skipping")
             continue
 
-        # ── Route one direct cable per FDT ────────────────────────────────────
+        fdt_pts = [fdt.snapped_geometry or fdt.geometry for fdt in sorted_fdts]
+
+        # ── Build one shared graph with closure + all FDT points tied in ──────
+        # makeGraph inserts every point as an exact vertex on the road network.
+        # Running Dijkstra once from closure_v gives shortest paths to all FDTs.
+        graph       = None
+        tree        = None
+        closure_v   = -1
+        fdt_verts: List[int] = []
+
+        try:
+            director = QgsVectorLayerDirector(
+                cable_router.road_layer, -1, '', '', '',
+                QgsVectorLayerDirector.DirectionBoth
+            )
+            director.addStrategy(QgsNetworkDistanceStrategy())
+            builder  = QgsGraphBuilder(cable_router.road_layer.crs())
+            input_pts = [closure_pt] + fdt_pts
+            tied_pts  = director.makeGraph(builder, input_pts)
+            graph     = builder.graph()
+
+            if tied_pts and len(tied_pts) == len(input_pts):
+                closure_v = graph.findVertex(tied_pts[0])
+                fdt_verts = [graph.findVertex(tp) for tp in tied_pts[1:]]
+
+            if closure_v >= 0:
+                tree, _ = QgsGraphAnalyzer.dijkstra(graph, closure_v, 0)
+        except Exception as exc:
+            logger.error(f"Shared graph build failed for {closure.name}: {exc}")
+            graph = None
+
+        v_count = graph.vertexCount() if graph else 0
+        e_count = graph.edgeCount()   if graph else 0
+
+        # ── Route one cable per FDT ───────────────────────────────────────────
         for idx, fdt in enumerate(sorted_fdts):
-            fdt_rid = _fdt_road(fdt)
-            fdt_pt  = fdt.snapped_geometry or fdt.geometry
+            fdt_pt = fdt_pts[idx]
 
             group_idx    = idx // MAX_FDT_PER_8CORE
             pos_in_group = idx % MAX_FDT_PER_8CORE
@@ -4521,12 +4815,52 @@ def route_closure_to_fdts(closures: List[DomeClosure],
             active    = cores[base_core]
             redundant = cores[base_core + 1]
 
-            # Direct Dijkstra from closure to FDT along road network
-            geom, length = cable_router.find_shortest_path(
-                closure_pt, fdt_pt,
-                start_road_id=closure_road_id,
-                end_road_id=fdt_rid,
-            )
+            geom: Optional[QgsGeometry] = None
+            length: float = 0.0
+
+            # ── Try shared-graph path first ───────────────────────────────────
+            fdt_v = fdt_verts[idx] if fdt_verts and idx < len(fdt_verts) else -1
+
+            if (tree is not None and graph is not None
+                    and closure_v >= 0 and fdt_v >= 0
+                    and fdt_v < len(tree) and tree[fdt_v] != -1):
+                pts: List[QgsPointXY] = []
+                current = fdt_v
+                steps   = 0
+                max_s   = v_count + e_count + 10
+                ok      = True
+
+                while current != closure_v:
+                    if current < 0 or current >= v_count:
+                        ok = False; break
+                    pts.append(graph.vertex(current).point())
+                    eid = tree[current]
+                    if eid < 0 or eid >= e_count:
+                        ok = False; break
+                    current = graph.edge(eid).fromVertex()
+                    steps += 1
+                    if steps > max_s:
+                        ok = False; break
+
+                if ok:
+                    pts.append(graph.vertex(closure_v).point())
+                    pts.reverse()
+                    pts = _dedupe_points(pts)
+                    if len(pts) >= 2:
+                        geom   = QgsGeometry.fromPolylineXY(pts)
+                        length = geom.length()
+
+            # ── Fallback: individual makeGraph for this FDT pair ──────────────
+            if geom is None or geom.isEmpty():
+                geom, length = cable_router.find_shortest_path_points(
+                    closure_pt, fdt_pt
+                )
+
+            if geom is None or geom.isEmpty():
+                logger.error(
+                    f"No road path found for {closure.name} → {fdt.name}; "
+                    f"cable skipped")
+                continue
 
             cables.append(CableSegment(
                 name=f"{closure.name}-{fdt.name}",
@@ -4557,70 +4891,75 @@ def route_pickup_to_closure(closures: List[DomeClosure],
                             index_mgr: SpatialIndexManager,
                             cable_router: CableRouter,
                             logger: PerformanceLogger) -> List[CableSegment]:
-    """Route feeder cables from pickup points (or generated points) to closures.
+    """Route feeder cables from pickup points to closures via shortest road path.
 
-    If a pickup layer is provided, the nearest pickup feature is used (or the
-    closure's explicitly assigned pickup_geometry if set).  When no layer is
-    supplied the script may have generated pickup points earlier; those are
-    preferred.  In the absence of any pickup geometry the nearest graph vertex
-    is used as a last-resort virtual pickup location.
+    Both the pickup point and the closure point are already ON the road network
+    (they were snapped to roads during generation).  For points already on roads
+    the correct approach is to find the nearest graph VERTEX directly — no
+    road_id projection is needed or helpful, and in fact passing a road_id can
+    cause _road_snap to project onto a DIFFERENT parallel road, sending Dijkstra
+    to the wrong start/end vertex and producing a long detour.
+
+    So for feeder routing we use find_shortest_path_points() which inserts both
+    endpoints as exact graph vertices so Dijkstra is guaranteed to find the
+    globally shortest path.
     """
     cables: List[CableSegment] = []
-    pick_idx = None
+    pick_idx   = None
     pick_geoms = {}
     if pickup_layer and pickup_layer.featureCount() > 0:
-        pick_idx = index_mgr.get_index(pickup_layer)
+        pick_idx   = index_mgr.get_index(pickup_layer)
         pick_geoms = index_mgr.geometries.get(pickup_layer.id(), {})
-    for closure in closures:
-        # Derive closure's road_id for proper road-snapping in find_shortest_path
-        closure_road_id: Optional[int] = None
-        if cable_router.road_index:
-            nearest_ids = cable_router.road_index.nearestNeighbor(closure.geometry, 1)
-            if nearest_ids:
-                closure_road_id = nearest_ids[0]
 
-        # if closure has an explicit pickup_geometry (either from layer or auto-gen) use it
+    for closure in closures:
+        # ── END point: the closure's actual placed position (pole on road) ─────
+        end_pt = closure.snapped_geometry or closure.geometry
+
+        # ── START point: pickup geometry ──────────────────────────────────────
+        start_pt = None
+
         if closure.pickup_geometry:
             start_pt = closure.pickup_geometry
         elif pick_idx:
-            # choose nearest pickup to closure geometry from user-supplied layer
-            nearest = pick_idx.nearestNeighbor(closure.geometry, 1)
+            nearest = pick_idx.nearestNeighbor(end_pt, 1)
             if nearest:
                 pid = nearest[0]
-                pg = pick_geoms.get(pid)
+                pg  = pick_geoms.get(pid)
                 if pg and pg.wkbType() == QgsWkbTypes.PointGeometry:
                     start_pt = pg.asPoint()
                 else:
-                    req = QgsFeatureRequest(pid)
+                    req  = QgsFeatureRequest(pid)
                     feat = next(pickup_layer.getFeatures(req), None)
-                    start_pt = feat.geometry().asPoint() if feat and feat.geometry() else closure.geometry
-            else:
-                start_pt = closure.geometry
-        else:
-            # no pickup information at all: use nearest graph vertex as virtual pickup
-            v_idx = cable_router.find_nearest_vertex(closure.geometry)
+                    if feat and feat.geometry():
+                        start_pt = feat.geometry().asPoint()
+
+        if start_pt is None:
+            v_idx = cable_router.find_nearest_vertex(end_pt)
             if v_idx >= 0 and cable_router.graph:
                 start_pt = cable_router.graph.vertex(v_idx).point()
             else:
-                start_pt = closure.geometry
-        geom, length = cable_router.find_shortest_path(
-            start_pt,
-            closure.geometry,
-            start_road_id=None,   # pickup point is already on road; no road_id needed
-            end_road_id=closure_road_id,
-        )
+                start_pt = end_pt
+
+        # ── True shortest road path via point-insertion graph ────────────────
+        # find_shortest_path_points() inserts both endpoints as exact graph
+        # vertices so Dijkstra is guaranteed to find the globally shortest path.
+        geom, length = cable_router.find_shortest_path_points(start_pt, end_pt)
+
         pickup_name = closure.pickup_name or "PICKUP"
-        cable_type = f"{closure.feed_capacity}C"
-        cable = CableSegment(
+        cable_type  = f"{closure.feed_capacity}C"
+        cables.append(CableSegment(
             name=f"{pickup_name}-{closure.name}-{cable_type}",
             start_device=pickup_name,
             end_device=closure.name,
             geometry=geom,
             length=length,
             fdt_id="",
-            core_info={"feed_capacity": closure.feed_capacity, "cable_type": cable_type}
-        )
-        cables.append(cable)
+            core_info={
+                "feed_capacity": closure.feed_capacity,
+                "cable_type":    cable_type,
+            }
+        ))
+
     logger.log(f"Routed {len(cables)} pickup-to-closure feeder cables")
     return cables
 
